@@ -1,9 +1,8 @@
-# uhi-extreme-heat-response
 # Urban Heat Island Response to Extreme Heat Events
 
 ## 1. Research Question
 a. How does urban heat island (UHI) intensity respond under extreme heat conditions compared to baseline summer conditions?
-b. Is the condition-dependence of UHI associated with differences in urban land use composition or other built-environment factors across cities?
+<br>b. Is the condition-dependence of UHI associated with differences in urban land use composition or other built-environment factors across cities?
 
 ## 2. Study Area and Data
 - Daily PRISM temperature data (tmean, tmax)
@@ -17,34 +16,30 @@ b. Is the condition-dependence of UHI associated with differences in urban land 
 
 ## 4. Repository Structure
 uhi-extreme-heat-response/
-│
-├── README.md
-├── environment.yml
-│
-├── data/
-│   ├── raw/                # untouched source data 
-│   ├── interim/            # masked, clipped, joined outputs
-│   └── processed/          # analysis-ready tables/rasters
-│
-├── notebooks/
-│   ├── 01_data_exploration.ipynb
-│   ├── 02_masking_and_aggregation.ipynb
-│   ├── 03_uhi_construction.ipynb
-│   └── 04_extreme_heat_events.ipynb
-│
-├── src/
-│   ├── config.py
-│   ├── masking.py
-│   ├── temperature_metrics.py
-│   ├── uhi.py
-│   └── extreme_events.py
-│
-├── results/
-│   ├── figures/
-│   └── tables/
-│
-└── docs/
-    └── methodology.md
-
+<pre>
+<br>├── README.md
+<br>├── environment.yml
+<br>├── data/
+<br>   ├── raw/                # untouched source data 
+<br>   ├── interim/            # masked, clipped, joined outputs
+<br>   └── processed/          # analysis-ready tables/rasters
+<br>├── notebooks/
+<br>  ├── 01_data_exploration.ipynb
+<br>   ├── 02_masking_and_aggregation.ipynb
+<br>   ├── 03_uhi_construction.ipynb
+<br>  └── 04_extreme_heat_events.ipynb
+<br>├── src/
+<br>  ├── config.py
+<br>  ├── masking.py
+<br>  ├── temperature_metrics.py
+<br>  ├── uhi.py
+<br>  └── extreme_events.py
+<br>├── results/
+<br>   ├── figures/
+<br>   └── tables/
+<br>└── docs/
+<br>    └── methodology.md
+</pre>
 
 ## 5. Reproducibility
+<text>
