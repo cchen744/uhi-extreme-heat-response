@@ -15,8 +15,8 @@ a. How does urban heat island (UHI) intensity respond under extreme heat conditi
 - Event-based comparison of UHI intensity
 
 ## 4. Repository Structure
-uhi-extreme-heat-response/
 <pre>
+uhi-extreme-heat-response/
 <br>├── README.md
 <br>├── environment.yml
 <br>├── data/
