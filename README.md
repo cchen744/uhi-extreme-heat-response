@@ -43,3 +43,7 @@ uhi-extreme-heat-response/
 
 ## 5. Reproducibility
 <text>
+
+## 6. Branches
+- Main: UHI defined by land surface temperature
+- Branch1: UHI is defined with 2m Air Temperature from PRISM
