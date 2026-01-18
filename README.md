@@ -21,11 +21,11 @@ uhi-extreme-heat-response/
 <br>├── environment.yml
 <br>├── data/
 <br>   ├── raw/                # untouched source data 
-<br>   ├── interim/            # masked, clipped, joined outputs
+<br>   ├── cities/            # masked, clipped, joined outputs
 <br>   └── processed/          # analysis-ready tables/rasters
 <br>├── notebooks/
 <br>  ├── 01_data_exploration.ipynb
-<br>   ├── 02_masking_and_aggregation.ipynb
+<br>   ├── 02_uhi_extreme_heat_response.ipynb
 <br>   ├── 03_uhi_construction.ipynb
 <br>  └── 04_extreme_heat_events.ipynb
 <br>├── src/
@@ -39,6 +39,7 @@ uhi-extreme-heat-response/
 <br>   └── tables/
 <br>└── docs/
 <br>    └── methodology.md
+uhi_pipeline.py              # preprocessing pipeline that extracts and cleans raw data using google earth engine
 </pre>
 
 ## 5. Reproducibility
