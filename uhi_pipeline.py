@@ -168,25 +168,66 @@ def make_daily_table(
 # ------------------------------------------------------------------
 # 5. Main entry: run one city
 # ------------------------------------------------------------------
+
+# 5.1 Helper: UA Interpreter
+def select_ua(ua_fc, *, ua_name=None, ua_contains=None, ua_names=None):
+    """
+    Return a FeatureCollection of matching Urbanized Areas.
+    Exactly one of ua_name / ua_contains / ua_names must be provided.
+
+    - ua_name: exact NAME20 match (string)
+    - ua_contains: substring match on NAME20 (string)
+    - ua_names: list of exact NAME20 strings
+    """
+    args = [ua_name is not None, ua_contains is not None, ua_names is not None]
+    if sum(args) != 1:
+        raise ValueError("Provide exactly one of ua_name, ua_contains, ua_names")
+
+    if ua_name is not None:
+        fc = ua_fc.filter(ee.Filter.eq("NAME20", ua_name))
+
+    elif ua_contains is not None:
+        fc = ua_fc.filter(ee.Filter.stringContains("NAME20", ua_contains))
+
+    else:
+        # exact list: build OR filter
+        filt = None
+        for name in ua_names:
+            f = ee.Filter.eq("NAME20", name)
+            filt = f if filt is None else ee.Filter.Or(filt, f)
+        fc = ua_fc.filter(filt)
+
+    return fc
+
+
 def run_city(
-    city_name,
+    *,
     ua_fc,
     start_date,
     end_date,
+    ua_name=None,
+    ua_contains=None,
+    ua_names=None,
     lst_band="LST_Night_1km",
     qc_band="QC_Night",
-    agg_func="mean",
-    ring_outer_m=30000,
-    ring_inner_m=5000,
+    agg_func="median",
+    ring_outer_m=12000,
+    ring_inner_m=3000,
     lst_scale_m=1000,
-    min_urban_pixels=30,
-    min_rural_pixels=30,
+    min_urban_pixels=50,
+    min_rural_pixels=50,
     extreme_percentile=90,
     out_csv=None
 ):
     # get city geometry
-    city = ua_fc.filter(ee.Filter.stringContains("NAME20", city_name))
-    city_geom = city.geometry()
+    city_fc = select_ua(ua_fc, ua_name=ua_name, ua_contains=ua_contains, ua_names=ua_names)
+
+    # sanity check (small, safe)
+    n = city_fc.size().getInfo()
+    if n == 0:
+        raise ValueError("No UA matched your query.")
+    # geometry() unions multiple UAs automatically
+    city_geom = city_fc.geometry()
 
     # masks
     urban_region, rural_region, urban_mask, rural_mask = build_masks(
