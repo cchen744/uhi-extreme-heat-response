@@ -8,6 +8,7 @@ a. How does urban heat island (UHI) intensity respond under extreme heat conditi
 - Daily PRISM temperature data (tmean, tmax)
 - Urban area boundaries (Census urban areas)
 - Study area
+
 <br>**Core Study Cities**
 
 | City         | Climate & Heat Exposure Context                                | UHI Risk & Inequality Signal                  | Role in Study Design                  |
