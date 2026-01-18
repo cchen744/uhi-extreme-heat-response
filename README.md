@@ -9,6 +9,7 @@ a. How does urban heat island (UHI) intensity respond under extreme heat conditi
 - Urban area boundaries (Census urban areas)
 - Study area
 **Core Study Cities**
+
 | City         | Climate & Heat Exposure Context                                | UHI Risk & Inequality Signal                  | Role in Study Design                  |
 | ------------ | -------------------------------------------------------------- | --------------------------------------------- | ------------------------------------- |
 | Phoenix      | Hot desert climate with frequent extreme heat events           | High UHI index; extensive NOAA UHI mapping    | Extreme-heat-dominated reference case |
