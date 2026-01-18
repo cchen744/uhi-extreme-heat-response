@@ -7,7 +7,10 @@ a. How does urban heat island (UHI) intensity respond under extreme heat conditi
 ## 2. Study Area and Data
 - Daily PRISM temperature data (tmean, tmax)
 - Urban area boundaries (Census urban areas)
-- Study area: Chicago metropolitan region
+- Study area: representative cities in different climate zone
+<p>
+<img src=https://upload.wikimedia.org/wikipedia/commons/7/77/K%C3%B6ppen_Climate_Types_US_50.png align="middle" width=600 />
+</p>
 
 ## 3. Method Overview
 - Pixel-level urban vs non-urban temperature contrasts
