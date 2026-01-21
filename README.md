@@ -17,7 +17,7 @@ a. How does urban heat island (UHI) intensity respond under extreme heat conditi
 | Houston      | Humid subtropical climate; high nighttime temperatures         | Strong UHI amplification and social disparity | Humid heat amplification contrast     |
 | Los Angeles  | Mediterranean coastal climate; dry summers                     | Pronounced intra-urban heat inequality        | Dry-heat and coastal mechanism case   |
 | Chicago      | Humid continental climate; low-frequency but severe heat waves | Large UHI disparities in extreme heat         | Condition-dependence test case        |
-| Philadelphia | Humid continental, legacy urban form                           | Stable redlining-associated UHI signal        | Compact, older urban morphology case  |
+| St.Louis, MI | Humid continental, legacy urban form                           | Stable redlining-associated UHI signal        | Compact, older urban morphology case  |
 | Nashville    | Transitional subtropical climate; rapid urban growth           | NOAA-mapped UHI heterogeneity                 | Rapid-expansion urban form case       |
 
 **Optional**
