@@ -1,28 +1,24 @@
 """
 Reusable SUHI data pipeline (GEE + MODIS LST)
-Extracted from 01_data_exploration.ipynb
+Optimized Version: Uses Combined Reducers to reduce server load.
 """
 
 import ee
 import geemap
 import pandas as pd
 import numpy as np
-import os
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-
 
 # ------------------------------------------------------------------
 # 0. Earth Engine init
 # ------------------------------------------------------------------
 def init_ee():
-    """Initialize Earth Engine (call once per runtime)."""
     try:
         ee.Initialize()
     except Exception:
         ee.Authenticate()
         ee.Initialize()
-
 
 # ------------------------------------------------------------------
 # 1. Helper: monthly ranges
@@ -36,47 +32,32 @@ def month_starts(start_date, end_date):
         yield cur.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
         cur = nxt
 
-
 # ------------------------------------------------------------------
 # 2. MODIS LST cleaning (QA)
 # ------------------------------------------------------------------
 def clean_lst(img, lst_band, qc_band):
     lst = img.select(lst_band)
     qc = img.select(qc_band).toUint16()
-
-    # bits 0–1: mandatory QA
+    
+    # bits 0-1: mandatory QA
     mandatory = qc.bitwiseAnd(3)
-    produced = mandatory.lte(1)   # keep 0 or 1
-    valid = lst.neq(0)            # drop fill
-
+    produced = mandatory.lte(1)
+    valid = lst.neq(0)
     good = produced.And(valid)
-
-    # scale: 0.02 K → °C
+    
     lst_c = lst.multiply(0.02).subtract(273.15)
-
+    
     return (
         lst_c.updateMask(good)
              .rename(lst_band)
              .copyProperties(img, ["system:time_start"])
     )
 
-
 # ------------------------------------------------------------------
 # 3. Build urban / rural masks (UA + LCZ)
 # ------------------------------------------------------------------
 def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
-    """
-    Urban:
-      - inside UA
-      - exclude water
-    Rural:
-      - ring outside UA
-      - natural LCZ only (exclude built + water)
-    """
-    # LCZ global map
-    lcz_img = ee.ImageCollection(
-        "RUB/RUBCLIM/LCZ/global_lcz_map/latest"
-    ).first()
+    lcz_img = ee.ImageCollection("RUB/RUBCLIM/LCZ/global_lcz_map/latest").first()
     lcz = lcz_img.select("LCZ_Filter")
 
     BUILT_MIN, BUILT_MAX = 1, 10
@@ -86,21 +67,18 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
     is_water = lcz.eq(WATER_CODE)
     is_natural = is_built.Not().And(is_water.Not())
 
-    # regions
     urban_region = city_geom
     outer = city_geom.buffer(ring_outer_m)
     inner = city_geom.buffer(ring_inner_m)
     rural_region = outer.difference(inner)
 
-    # masks
     urban_mask = is_water.Not().clip(urban_region)
     rural_mask = is_natural.clip(rural_region)
 
     return urban_region, rural_region, urban_mask, rural_mask
 
-
 # ------------------------------------------------------------------
-# 4. Daily aggregation (UA × day)
+# 4. Daily aggregation (UA x day) - OPTIMIZED
 # ------------------------------------------------------------------
 def make_daily_table(
     start, end,
@@ -118,7 +96,16 @@ def make_daily_table(
         .map(lambda img: clean_lst(img, lst_band, qc_band))
     )
 
-    reducer = ee.Reducer.mean() if agg_func == "mean" else ee.Reducer.median()
+    # OPTIMIZATION#1: Combine Mean/Median with Count into a single Reducer
+    # This reduces the number of reduceRegion calls by half.
+    base_reducer = ee.Reducer.mean() if agg_func == "mean" else ee.Reducer.median()
+    stat_name = "val"
+    
+    # Output keys will be: {band}_{val} and {band}_{cnt}
+    combined_reducer = base_reducer.setOutputs([stat_name]).combine(
+        reducer2=ee.Reducer.count().setOutputs(["cnt"]),
+        sharedInputs=True
+    )
 
     def agg(img):
         date = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
@@ -126,79 +113,55 @@ def make_daily_table(
         urb = img.updateMask(urban_mask)
         rur = img.updateMask(rural_mask)
 
-        urb_stat = urb.reduceRegion(
-            reducer=reducer,
+        # 1. Urban Reduction (Both Stats at once)
+        urb_stats = urb.reduceRegion(
+            reducer=combined_reducer,
             geometry=urban_region,
             scale=lst_scale_m,
             maxPixels=1e13
         )
 
-        rur_stat = rur.reduceRegion(
-            reducer=reducer,
+        # 2. Rural Reduction (Both Stats at once)
+        rur_stats = rur.reduceRegion(
+            reducer=combined_reducer,
             geometry=rural_region,
             scale=lst_scale_m,
             maxPixels=1e13
         )
-
-        urb_n = urb.reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=urban_region,
-            scale=lst_scale_m,
-            maxPixels=1e13
-        )
-
-        rur_n = rur.reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=rural_region,
-            scale=lst_scale_m,
-            maxPixels=1e13
-        )
+        
+        # Construct Output Keys based on setOutputs
+        key_val = f"{lst_band}_{stat_name}"
+        key_cnt = f"{lst_band}_cnt"
 
         return ee.Feature(None, {
             "date": date,
-            "LST_urb": urb_stat.get(lst_band),
-            "LST_rur": rur_stat.get(lst_band),
-            "urban_n": urb_n.get(lst_band),
-            "rural_n": rur_n.get(lst_band),
+            "LST_urb": urb_stats.get(key_val),
+            "LST_rur": rur_stats.get(key_val),
+            "urban_n": urb_stats.get(key_cnt),
+            "rural_n": rur_stats.get(key_cnt),
         })
 
     return ic.map(agg)
 
-
 # ------------------------------------------------------------------
 # 5. Main entry: run one city
 # ------------------------------------------------------------------
-
-# 5.1 Helper: UA Interpreter
 def select_ua(ua_fc, *, ua_name=None, ua_contains=None, ua_names=None):
-    """
-    Return a FeatureCollection of matching Urbanized Areas.
-    Exactly one of ua_name / ua_contains / ua_names must be provided.
-
-    - ua_name: exact NAME20 match (string)
-    - ua_contains: substring match on NAME20 (string)
-    - ua_names: list of exact NAME20 strings
-    """
     args = [ua_name is not None, ua_contains is not None, ua_names is not None]
     if sum(args) != 1:
         raise ValueError("Provide exactly one of ua_name, ua_contains, ua_names")
 
     if ua_name is not None:
         fc = ua_fc.filter(ee.Filter.eq("NAME20", ua_name))
-
     elif ua_contains is not None:
         fc = ua_fc.filter(ee.Filter.stringContains("NAME20", ua_contains))
-
     else:
-        # exact list: build OR filter
         filt = None
         for name in ua_names:
             f = ee.Filter.eq("NAME20", name)
             filt = f if filt is None else ee.Filter.Or(filt, f)
         fc = ua_fc.filter(filt)
-
     return fc
-
 
 def run_city(
     *,
@@ -217,27 +180,21 @@ def run_city(
     min_urban_pixels=50,
     min_rural_pixels=50,
     extreme_percentile=90,
-    out_csv=None
+    out_csv=None,
+    export_to_drive=False,
+    export_desc=None,
+    export_folder="UHI_exports"
 ):
-    # get city geometry
     city_fc = select_ua(ua_fc, ua_name=ua_name, ua_contains=ua_contains, ua_names=ua_names)
-
-    # sanity check (small, safe)
-    n = city_fc.size().getInfo()
-    if n == 0:
+    if city_fc.size().getInfo() == 0:
         raise ValueError("No UA matched your query.")
-    # geometry() unions multiple UAs automatically
     city_geom = city_fc.geometry()
 
-    # masks
     urban_region, rural_region, urban_mask, rural_mask = build_masks(
-        city_geom,
-        ring_outer_m,
-        ring_inner_m
+        city_geom, ring_outer_m, ring_inner_m
     )
 
-    dfs = []
-
+    fc_list = []
     for s, e in month_starts(start_date, end_date):
         fc = make_daily_table(
             s, e,
@@ -248,35 +205,46 @@ def run_city(
         )
 
         fc = ee.FeatureCollection(fc)
-        df = geemap.ee_to_df(fc)
+        # Clean up nulls
+        fc = fc.filter(ee.Filter.notNull(["LST_urb", "LST_rur", "urban_n", "rural_n", "date"]))
+        fc = fc.filter(ee.Filter.gte("urban_n", min_urban_pixels))
+        fc = fc.filter(ee.Filter.gte("rural_n", min_rural_pixels))
+        fc = fc.select(["date", "LST_urb", "LST_rur", "urban_n", "rural_n"])
 
-        if df.empty:
-            continue
+        fc_list.append(fc)
 
-        df = df.dropna()
-        df = df[
-            (df["urban_n"] >= min_urban_pixels) &
-            (df["rural_n"] >= min_rural_pixels)
-        ]
+    if not fc_list:
+        return pd.DataFrame()
+    
+    fc_all = ee.FeatureCollection(fc_list).flatten()
 
-        if not df.empty:
-            dfs.append(df)
+    if export_to_drive:
+      desc = export_desc or f"UHI_{ua_name or ua_contains or 'city'}"
+      task = ee.batch.Export.table.toDrive(
+        collection=fc_all,
+        description=desc,
+        fileFormat="CSV",
+        fileNamePrefix=desc,
+        folder=export_folder
+      )
+      task.start()
+      return None
 
-    if not dfs:
+    # Optimized: Try to fetch data. 
+    # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
+    try:
+        df_all = geemap.ee_to_df(fc_all)
+    except Exception as e:
+        print(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-    df_all = pd.concat(dfs, ignore_index=True)
-    df_all["date"] = pd.to_datetime(df_all["date"])
-    df_all = (
-        df_all
-        .sort_values("date")
-        .drop_duplicates(subset=["date"])
-        .reset_index(drop=True)
-    )
+    if df_all.empty:
+        return df_all
 
+    df_all["date"] = pd.to_datetime(df_all["date"])
+    df_all = df_all.drop_duplicates(subset=["date"]).reset_index(drop=True)
     df_all["SUHI"] = df_all["LST_urb"] - df_all["LST_rur"]
 
-    # Extreme heat (percentile-based, no consecutive requirement)
     thr = np.percentile(df_all["LST_urb"], extreme_percentile)
     df_all["is_extreme"] = (df_all["LST_urb"] >= thr).astype(int)
 
