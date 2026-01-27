@@ -109,7 +109,7 @@ def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857"):
           cell = ee.Geometry.Rectangle([x, y, x.add(cell_size_m), y.add(cell_size_m)], crs, False)
             
           intersect_result = cell.intersection(region_proj, ee.ErrorMargin(1))
-          cell_clip = ee.Algorithms.If(ee.IsUnspecified(intersect_result),
+          cell_clip = ee.Algorithms.If(ee.isUnspecified(intersect_result),
                               ee.Geometry.Point([0,0], crs).buffer(0),
                               intersect_result)
           cell_clip = ee.Geometry(cell_clip) # Ensure explicit cast to Geometry
