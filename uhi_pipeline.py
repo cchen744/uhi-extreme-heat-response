@@ -77,8 +77,49 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
 
     return urban_region, rural_region, urban_mask, rural_mask
 
+# ====== UPDATE: added grid cell generator (1km x 1km, fishnet) ========
 # ------------------------------------------------------------------
-# 4. Daily aggregation (UA x day) - OPTIMIZED
+# 4. project urban area to crs and generate fishnet on 1km x 1km
+# ------------------------------------------------------------------
+def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857"):
+    """
+    Create a square grid (cell_size_m x cell_size_m) covering region_geom.
+    Returns ee.FeatureCollection with properties: cell_id, x, y
+    """
+    # 1) Reproject region to a metric CRS so bounds are in meters
+    region_proj = region_geom.transform(crs, 1)
+
+    # 2) Get bounding box in projected coordinates
+    bounds = region_proj.bounds()
+    ring = ee.List(bounds.coordinates().get(0))
+    xmin = ee.Number(ee.List(ring.get(0)).get(0))
+    ymin = ee.Number(ee.List(ring.get(0)).get(1))
+    xmax = ee.Number(ee.List(ring.get(2)).get(0))
+    ymax = ee.Number(ee.List(ring.get(2)).get(1))
+
+    # 3) Generate x/y sequences
+    xs = ee.List.sequence(xmin, xmax.subtract(cell_size_m), cell_size_m)
+    ys = ee.List.sequence(ymin, ymax.subtract(cell_size_m), cell_size_m)
+
+    # 4) Build rectangles and keep only those intersecting the region
+    def make_row(y):
+        y = ee.Number(y)
+        def make_cell(x):
+          x = ee.Number(x)
+          cell = ee.Geometry.Rectangle([x, y, x.add(cell_size_m), y.add(cell_size_m)], crs, False)
+
+          inter = cell.intersects(region_proj, ee.ErrorMargin(1))
+          cell_clip = cell.intersection(region_proj, ee.ErrorMargin(1))
+
+          cell_id = ee.String(x.format("%.0f")).cat("_").cat(y.format("%.0f"))
+          return ee.Feature(cell_clip, {"cell_id": cell_id, "x": x, "y": y}).set("keep", inter)
+
+    grid_fc = ee.FeatureCollection(ys.map(make_row)).flatten()
+    grid_fc = grid_fc.filter(ee.Filter.eq("keep", True)).select(["cell_id", "x", "y"])
+    return grid_fc
+
+# ------------------------------------------------------------------
+# 5. Daily aggregation (UA x day) - OPTIMIZED
 # ------------------------------------------------------------------
 def make_daily_table(
     start, end,
@@ -144,8 +185,97 @@ def make_daily_table(
     return ic.map(agg)
 
 # ------------------------------------------------------------------
-# 5. Main entry: run one city
+# 6. UPDATE: new function for grid-cell-level daily output
 # ------------------------------------------------------------------
+def make_daily_table_cells(
+    start, end,
+    urban_region, rural_region,
+    urban_mask, rural_mask,
+    lst_band, qc_band,
+    agg_func="mean",
+    lst_scale_m=1000,
+    cell_scale_m=1000,
+    crs="EPSG:3857"
+):
+    """
+    Output FeatureCollection with one feature per (day, cell).
+    Each feature contains:
+      - date
+      - cell_id
+      - LST_urb_cell, cell_n
+      - LST_rur (city-level), rural_n
+    """
+
+    # 1) Build 1km fishnet grid within urban_region (projected to CRS meters)
+    grid_fc = make_grid_fc(urban_region, cell_size_m=cell_scale_m, crs=crs)
+
+    # 2) Load & clean MODIS LST images for the given time window
+    ic = (
+        ee.ImageCollection("MODIS/061/MYD11A1")
+        .filterBounds(urban_region)
+        .filterDate(start, end)
+        .select([lst_band, qc_band])
+        .map(lambda img: clean_lst(img, lst_band, qc_band))
+    )
+
+    # 3) Combined reducer: mean/median + count in one pass (same as city-level)
+    base_reducer = ee.Reducer.mean() if agg_func == "mean" else ee.Reducer.median()
+    stat_name = "val"
+    combined_reducer = base_reducer.setOutputs([stat_name]).combine(
+        reducer2=ee.Reducer.count().setOutputs(["cnt"]),
+        sharedInputs=True
+    )
+
+    key_val = f"{lst_band}_{stat_name}"
+    key_cnt = f"{lst_band}_cnt"
+
+    def agg(img):
+        # 4) Attach a date string to every output row (per day)
+        date = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
+
+        # 5) Apply masks: urban excludes water; rural uses natural-only ring
+        urb = img.updateMask(urban_mask)
+        rur = img.updateMask(rural_mask)
+
+        # 6) Rural reference is city-level (one value per day)
+        rur_stats = rur.reduceRegion(
+            reducer=combined_reducer,
+            geometry=rural_region,
+            scale=lst_scale_m,
+            maxPixels=1e13
+        )
+        lst_rur = rur_stats.get(key_val)
+        rural_n = rur_stats.get(key_cnt)
+
+        # 7) Urban is reduced per grid cell (many values per day)
+        #    reduceRegions returns a FeatureCollection with stats per feature geometry.
+        urb_cells = urb.reduceRegions(
+            collection=grid_fc,
+            reducer=combined_reducer,
+            scale=lst_scale_m,
+            tileScale=4
+        )
+
+        # 8) For each cell, write city-level rural reference into its properties
+        def add_rural_props(ft):
+            ft = ee.Feature(ft)
+            return ft.set({
+                "date": date,
+                "LST_rur": lst_rur,
+                "rural_n": rural_n,
+                "LST_urb_cell": ft.get(key_val),
+                "cell_n": ft.get(key_cnt),
+            })
+
+        urb_cells = urb_cells.map(add_rural_props)
+
+        # 9) Keep only needed columns
+        return urb_cells.select(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"])
+
+    # 10) Map over days and flatten day-wise FC into one FC
+    return ee.FeatureCollection(ic.map(agg)).flatten()
+
+
 def select_ua(ua_fc, *, ua_name=None, ua_contains=None, ua_names=None):
     args = [ua_name is not None, ua_contains is not None, ua_names is not None]
     if sum(args) != 1:
@@ -163,6 +293,9 @@ def select_ua(ua_fc, *, ua_name=None, ua_contains=None, ua_names=None):
         fc = ua_fc.filter(filt)
     return fc
 
+# ------------------------------------------------------------------
+# 7. UPDATE: Main entry: have options for running one city or running one grid cell
+# ------------------------------------------------------------------
 def run_city(
     *,
     ua_fc,
@@ -179,6 +312,10 @@ def run_city(
     lst_scale_m=1000,
     min_urban_pixels=50,
     min_rural_pixels=50,
+    unit='city',
+    cell_scale_m=1000,
+    min_cell_pixels=1,
+    cell_crs="EPSG:3857",
     extreme_percentile=90,
     out_csv=None,
     export_to_drive=False,
@@ -196,6 +333,7 @@ def run_city(
 
     fc_list = []
     for s, e in month_starts(start_date, end_date):
+      if unit == 'city':
         fc = make_daily_table(
             s, e,
             urban_region, rural_region,
@@ -210,8 +348,30 @@ def run_city(
         fc = fc.filter(ee.Filter.gte("urban_n", min_urban_pixels))
         fc = fc.filter(ee.Filter.gte("rural_n", min_rural_pixels))
         fc = fc.select(["date", "LST_urb", "LST_rur", "urban_n", "rural_n"])
+      
+      elif unit == "cell":
+        fc = make_daily_table_cells(
+        s, e,
+        urban_region, rural_region,
+        urban_mask, rural_mask,
+        lst_band, qc_band,
+        agg_func,
+        lst_scale_m=lst_scale_m,
+        cell_scale_m=cell_scale_m,
+        crs=cell_crs
+        )
+        fc = ee.FeatureCollection(fc)
+        fc = fc.filter(ee.Filter.notNull(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"]))
+        fc = fc.filter(ee.Filter.gte("cell_n", min_cell_pixels))
+        fc = fc.filter(ee.Filter.gte("rural_n", min_rural_pixels))
+        fc = fc.select(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"])
 
-        fc_list.append(fc)
+
+      else:
+        raise ValueError("unit must be 'city' or 'cell'")
+      
+      fc_list.append(fc)
+      
 
     if not fc_list:
         return pd.DataFrame()
@@ -238,17 +398,16 @@ def run_city(
         print(f"Error fetching data: {e}")
         return pd.DataFrame()
 
-    if df_all.empty:
-        return df_all
-
     df_all["date"] = pd.to_datetime(df_all["date"])
-    df_all = df_all.drop_duplicates(subset=["date"]).reset_index(drop=True)
-    df_all["SUHI"] = df_all["LST_urb"] - df_all["LST_rur"]
 
-    thr = np.percentile(df_all["LST_urb"], extreme_percentile)
-    df_all["is_extreme"] = (df_all["LST_urb"] >= thr).astype(int)
 
-    if out_csv:
-        df_all.to_csv(out_csv, index=False)
+    if unit == "city":
+      df_all = df_all.drop_duplicates(subset=["date"]).reset_index(drop=True)
+      df_all["SUHI"] = df_all["LST_urb"] - df_all["LST_rur"]
+
+
+    elif unit == "cell":
+      df_all = df_all.drop_duplicates(subset=["date", "cell_id"]).reset_index(drop=True)
+      df_all["SUHI"] = df_all["LST_urb_cell"] - df_all["LST_rur"]
 
     return df_all
