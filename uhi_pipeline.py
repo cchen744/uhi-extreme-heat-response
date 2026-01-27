@@ -117,7 +117,10 @@ def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857"):
             
           cell_id = ee.String(x.format("%.0f")).cat("_").cat(y.format("%.0f"))
           return ee.Feature(cell_clip, {"cell_id": cell_id, "x": x, "y": y}).set("keep", inter)
-
+        
+        row_features = xs.map(make_cell)
+        return ee.FeatureCollection(row_features)
+    
     grid_fc = ee.FeatureCollection(ys.map(make_row)).flatten()
     grid_fc = grid_fc.filter(ee.Filter.eq("keep", True)).select(["cell_id", "x", "y"])
     return grid_fc
