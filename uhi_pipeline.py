@@ -108,13 +108,15 @@ def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857"):
           x = ee.Number(x)
           cell = ee.Geometry.Rectangle([x, y, x.add(cell_size_m), y.add(cell_size_m)], crs, False)
             
-          intersect_result = cell.intersection(region_proj, ee.ErrorMargin(1))
-          cell_clip = ee.Algorithms.If(intersect_result.isUnspecified(),
-                              ee.Geometry.Point([0,0], crs).buffer(0),
-                              intersect_result)
-          cell_clip = ee.Geometry(cell_clip) # Ensure explicit cast to Geometry
-          inter = ee.Number(cell_clip.area(crs=crs)).gt(0)
-            
+          inter = cell.intersects(region_proj, ee.ErrorMargin(1))
+
+          cell_clip = ee.Geometry(
+                ee.Algorithms.If(
+                inter,
+                cell.intersection(region_proj, ee.ErrorMargin(1)),
+                cell
+                    )
+                      )
           cell_id = ee.String(x.format("%.0f")).cat("_").cat(y.format("%.0f"))
           return ee.Feature(cell_clip, {"cell_id": cell_id, "x": x, "y": y}).set("keep", inter)
         
@@ -401,6 +403,8 @@ def run_city(
     # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
     try:
         df_all = geemap.ee_to_df(fc_all)
+        print("df_all columns:", list(df_all.columns))
+        print("df_all shape:", df_all.shape)
     except Exception as e:
         print(f"Error fetching data: {e}")
         return pd.DataFrame()
