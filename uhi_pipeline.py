@@ -81,51 +81,110 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
 # ------------------------------------------------------------------
 # 4. project urban area to crs and generate fishnet on 1km x 1km
 # ------------------------------------------------------------------
-def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857"):
+# def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857",err_m=100):
+#     """
+#     Create a square grid (cell_size_m x cell_size_m) covering region_geom.
+#     Returns ee.FeatureCollection with properties: cell_id, x, y
+#     """
+#     # 1) Reproject region to a metric CRS so bounds are in meters
+#     region_proj = region_geom.transform(crs, 1)
+
+#     # 2) Get bounding box in projected coordinates
+#     bounds = region_geom.bounds(ee.ErrorMargin(err_m)).transform(crs, 1)
+
+#     ring = ee.List(bounds.coordinates().get(0)) # list of [x,y]
+#     # robust min/max across all ring points (no index assumptions)
+#     xs = ring.map(lambda p: ee.Number(ee.List(p).get(0)))
+#     ys = ring.map(lambda p: ee.Number(ee.List(p).get(1)))
+
+#     xmin = ee.Number(xs.reduce(ee.Reducer.min()))
+#     xmax = ee.Number(xs.reduce(ee.Reducer.max()))
+#     ymin = ee.Number(ys.reduce(ee.Reducer.min()))
+#     ymax = ee.Number(ys.reduce(ee.Reducer.max()))
+
+#     # 3) Generate x/y sequences
+#     xs = ee.List.sequence(xmin, xmax.subtract(cell_size_m), cell_size_m)
+#     ys = ee.List.sequence(ymin, ymax.subtract(cell_size_m), cell_size_m)
+
+#     # hard cap for check
+#     xs_seq = ee.List.sequence(xmin, xmin.add(cell_size_m * 5), cell_size_m)
+#     ys_seq = ee.List.sequence(ymin, ymin.add(cell_size_m * 5), cell_size_m)
+
+
+#     # 4) Build rectangles and keep only those intersecting the region
+#     def make_row(y):
+#         y = ee.Number(y)
+#         def make_cell(x):
+#           x = ee.Number(x)
+#           cell = ee.Geometry.Rectangle([x, y, x.add(cell_size_m), y.add(cell_size_m)], crs, False)
+            
+#           inter = cell.intersects(region_proj, ee.ErrorMargin(err_m))
+
+#           cell_clip = ee.Geometry(
+#                 ee.Algorithms.If(
+#                 inter,
+#                 cell.intersection(region_proj, ee.ErrorMargin(err_m)),
+#                 cell
+#                     )
+#                       )
+#           cell_id = ee.String(x.format("%.0f")).cat("_").cat(y.format("%.0f"))
+#           return ee.Feature(cell_clip, {"cell_id": cell_id, "x": x, "y": y}).set("keep", inter)
+        
+#         row_features = xs.map(make_cell) 
+#         return ee.FeatureCollection(row_features)
+    
+#     grid_fc = ee.FeatureCollection(ys.map(make_row)).flatten() # changed from ys to ys_seq
+#     grid_fc = grid_fc.filter(ee.Filter.eq("keep", True)).select(["cell_id", "x", "y"])
+#     return grid_fc
+
+# ================ Here we use ReduceToVector to simplify the grid cell geenration ============
+def make_grid_fc_2(region_geom, cell_size_m=1000, crs="EPSG:3857", err_m=100):
     """
-    Create a square grid (cell_size_m x cell_size_m) covering region_geom.
-    Returns ee.FeatureCollection with properties: cell_id, x, y
+    Build 1km x 1km fishnet polygons in a metric CRS using reduceToVectors.
+    Much more stable than List.sequence + map + flatten.
     """
-    # 1) Reproject region to a metric CRS so bounds are in meters
+    # 1) Bounds in target CRS (meters)
+    bounds = region_geom.bounds(ee.ErrorMargin(err_m)).transform(crs, 1)
+
+    # 2) Create a constant image in the desired projection/scale
+    proj = ee.Projection(crs).atScale(cell_size_m)
+    img = ee.Image.constant(1).reproject(proj)
+
+    # 3) Vectorize pixels inside bounds -> grid polygons
+    grid = img.reduceToVectors(
+        geometry=bounds,
+        scale=cell_size_m,
+        geometryType="polygon",
+        reducer=ee.Reducer.countEvery(),
+        maxPixels=1e13
+    )
+
     region_proj = region_geom.transform(crs, 1)
 
-    # 2) Get bounding box in projected coordinates
-    bounds = region_proj.bounds()
-    ring = ee.List(bounds.coordinates().get(0))
-    xmin = ee.Number(ee.List(ring.get(0)).get(0))
-    ymin = ee.Number(ee.List(ring.get(0)).get(1))
-    xmax = ee.Number(ee.List(ring.get(2)).get(0))
-    ymax = ee.Number(ee.List(ring.get(2)).get(1))
-
-    # 3) Generate x/y sequences
-    xs = ee.List.sequence(xmin, xmax.subtract(cell_size_m), cell_size_m)
-    ys = ee.List.sequence(ymin, ymax.subtract(cell_size_m), cell_size_m)
-
-    # 4) Build rectangles and keep only those intersecting the region
-    def make_row(y):
-        y = ee.Number(y)
-        def make_cell(x):
-          x = ee.Number(x)
-          cell = ee.Geometry.Rectangle([x, y, x.add(cell_size_m), y.add(cell_size_m)], crs, False)
-            
-          inter = cell.intersects(region_proj, ee.ErrorMargin(1))
-
-          cell_clip = ee.Geometry(
-                ee.Algorithms.If(
+    # 4) Clip each cell to the city and create a stable-ish cell_id from centroid coords
+    def post(ft):
+        ft = ee.Feature(ft)
+        geom = ft.geometry()
+        inter = geom.intersects(region_proj, ee.ErrorMargin(err_m))
+        geom_clip = ee.Geometry(
+            ee.Algorithms.If(
                 inter,
-                cell.intersection(region_proj, ee.ErrorMargin(1)),
-                cell
-                    )
-                      )
-          cell_id = ee.String(x.format("%.0f")).cat("_").cat(y.format("%.0f"))
-          return ee.Feature(cell_clip, {"cell_id": cell_id, "x": x, "y": y}).set("keep", inter)
-        
-        row_features = xs.map(make_cell)
-        return ee.FeatureCollection(row_features)
-    
-    grid_fc = ee.FeatureCollection(ys.map(make_row)).flatten()
-    grid_fc = grid_fc.filter(ee.Filter.eq("keep", True)).select(["cell_id", "x", "y"])
-    return grid_fc
+                geom.intersection(region_proj, ee.ErrorMargin(err_m)),
+                geom
+            )
+        )
+
+        # centroid in CRS -> use rounded meters as id components
+        c = geom.centroid(ee.ErrorMargin(err_m)).transform(crs, 1).coordinates()
+        x = ee.Number(ee.List(c).get(0)).round()
+        y = ee.Number(ee.List(c).get(1)).round()
+        cell_id = x.format('%.0f').cat('_').cat(y.format('%.0f'))
+
+        return ee.Feature(geom_clip, {"cell_id": cell_id}).set("keep", inter)
+
+    grid = grid.map(post).filter(ee.Filter.eq("keep", True)).select(["cell_id"])
+    return grid
+
 
 # ------------------------------------------------------------------
 # 5. Daily aggregation (UA x day) - OPTIMIZED
