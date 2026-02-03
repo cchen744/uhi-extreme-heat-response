@@ -275,7 +275,7 @@ def make_daily_table_cells(
     """
 
     # 1) Build 1km fishnet grid within urban_region (projected to CRS meters)
-    grid_fc = make_grid_fc(urban_region, cell_size_m=cell_scale_m, crs=crs)
+    grid_fc = make_grid_fc_2(urban_region, cell_size_m=cell_scale_m, crs=crs)
 
     # 2) Load & clean MODIS LST images for the given time window
     ic = (
@@ -388,7 +388,9 @@ def run_city(
     out_csv=None,
     export_to_drive=False,
     export_desc=None,
-    export_folder="UHI_exports"
+    export_folder="UHI_exports",
+    debug=False,
+    relax_filters_on_empty=True
 ):
     city_fc = select_ua(ua_fc, ua_name=ua_name, ua_contains=ua_contains, ua_names=ua_names)
     if city_fc.size().getInfo() == 0:
@@ -399,76 +401,118 @@ def run_city(
         city_geom, ring_outer_m, ring_inner_m
     )
 
-    fc_list = []
-    for s, e in month_starts(start_date, end_date):
-      if unit == 'city':
-        fc = make_daily_table(
-            s, e,
-            urban_region, rural_region,
-            urban_mask, rural_mask,
-            lst_band, qc_band,
-            agg_func, lst_scale_m
-        )
+    def build_fc_list(min_urban_px, min_rural_px, min_cell_px):
+          fc_list_local = []
+          month_ranges_local = []
+          for s, e in month_starts(start_date, end_date):
+            month_ranges_local.append((s, e))
+            if unit == 'city':
+              fc = make_daily_table(
+                  s, e,
+                  urban_region, rural_region,
+                  urban_mask, rural_mask,
+                  lst_band, qc_band,
+                  agg_func, lst_scale_m
+              )
 
-        fc = ee.FeatureCollection(fc)
-        # Clean up nulls
-        fc = fc.filter(ee.Filter.notNull(["LST_urb", "LST_rur", "urban_n", "rural_n", "date"]))
-        fc = fc.filter(ee.Filter.gte("urban_n", min_urban_pixels))
-        fc = fc.filter(ee.Filter.gte("rural_n", min_rural_pixels))
-        fc = fc.select(["date", "LST_urb", "LST_rur", "urban_n", "rural_n"])
-      
-      elif unit == "cell":
-        fc = make_daily_table_cells(
-        s, e,
-        urban_region, rural_region,
-        urban_mask, rural_mask,
-        lst_band, qc_band,
-        agg_func,
-        lst_scale_m=lst_scale_m,
-        cell_scale_m=cell_scale_m,
-        crs=cell_crs
-        )
-        fc = ee.FeatureCollection(fc)
-        fc = fc.filter(ee.Filter.notNull(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"]))
-        fc = fc.filter(ee.Filter.gte("cell_n", min_cell_pixels))
-        fc = fc.filter(ee.Filter.gte("rural_n", min_rural_pixels))
-        fc = fc.select(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"])
+              fc = ee.FeatureCollection(fc)
+              # Clean up nulls
+              fc = fc.filter(ee.Filter.notNull(["LST_urb", "LST_rur", "urban_n", "rural_n", "date"]))
+              fc = fc.filter(ee.Filter.gte("urban_n", min_urban_px))
+              fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
+              fc = fc.select(["date", "LST_urb", "LST_rur", "urban_n", "rural_n"])
+            
+            elif unit == "cell":
+              fc = make_daily_table_cells(
+              s, e,
+              urban_region, rural_region,
+              urban_mask, rural_mask,
+              lst_band, qc_band,
+              agg_func,
+              lst_scale_m=lst_scale_m,
+              cell_scale_m=cell_scale_m,
+              crs=cell_crs
+              )
+              fc = ee.FeatureCollection(fc)
+              fc = fc.filter(ee.Filter.notNull(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"]))
+              fc = fc.filter(ee.Filter.gte("cell_n", min_cell_px))
+              fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
+              fc = fc.select(["date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n"])
 
 
-      else:
-        raise ValueError("unit must be 'city' or 'cell'")
-      
-      fc_list.append(fc)
-      
+            else:
+              raise ValueError("unit must be 'city' or 'cell'")
+              
+            fc_list_local.append(fc)
 
-    if not fc_list:
-        return pd.DataFrame()
-    
-    fc_all = ee.FeatureCollection(fc_list).flatten()
+            return fc_list_local, month_ranges_local
 
-    if export_to_drive:
-      desc = export_desc or f"UHI_{ua_name or ua_contains or 'city'}"
-      task = ee.batch.Export.table.toDrive(
-        collection=fc_all,
-        description=desc,
-        fileFormat="CSV",
-        fileNamePrefix=desc,
-        folder=export_folder
-      )
-      task.start()
-      return None
 
-    # Optimized: Try to fetch data. 
-    # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
-    try:
-        df_all = geemap.ee_to_df(fc_all)
-        print("df_all columns:", list(df_all.columns))
-        print("df_all shape:", df_all.shape)
-    except Exception as e:
-        print(f"Error fetching data: {e}")
-        return pd.DataFrame()
+            fc_list, month_ranges = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)  
+            
 
-    df_all["date"] = pd.to_datetime(df_all["date"])
+            if not fc_list:
+              return pd.DataFrame()
+          
+            fc_all = ee.FeatureCollection(fc_list).flatten()
+            fc_all_size = fc_all.size().getInfo()
+            if fc_all_size == 0:
+              if relax_filters_on_empty:
+                relaxed_urban_px = 1
+                relaxed_rural_px = 1
+                relaxed_cell_px = 1
+                print(
+                  "No features returned after filtering. Retrying with relaxed pixel thresholds: "
+                  f"urban>={relaxed_urban_px}, rural>={relaxed_rural_px}, cell>={relaxed_cell_px}."
+                )
+                fc_list, month_ranges = build_fc_list(relaxed_urban_px, relaxed_rural_px, relaxed_cell_px)
+                fc_all = ee.FeatureCollection(fc_list).flatten()
+                fc_all_size = fc_all.size().getInfo()
+              if fc_all_size == 0:
+                print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
+                if debug:
+                  print("Monthly feature counts after filtering:")
+                  for (s, e), fc in zip(month_ranges, fc_list):
+                    monthly_size = fc.size().getInfo()
+                    print(f"  {s} to {e}: {monthly_size}")
+                  print(
+                    "Consider lowering min_urban_pixels/min_rural_pixels "
+                    "(or min_cell_pixels for unit='cell') or expanding date/AOI filters."
+                  )
+                return pd.DataFrame()
+
+            fc_all_size = fc_all.size().getInfo()
+            if fc_all_size == 0:
+              print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
+              return pd.DataFrame()
+
+            if export_to_drive:
+              desc = export_desc or f"UHI_{ua_name or ua_contains or 'city'}"
+              task = ee.batch.Export.table.toDrive(
+                collection=fc_all,
+                description=desc,
+                fileFormat="CSV",
+                fileNamePrefix=desc,
+                folder=export_folder
+              )
+              task.start()
+              return None
+
+            # Optimized: Try to fetch data. 
+            # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
+            try:
+                df_all = geemap.ee_to_df(fc_all)
+                print("df_all columns:", list(df_all.columns))
+                print("df_all shape:", df_all.shape)
+                print(df_all.empty)
+            except Exception as e:
+                print(f"Error fetching data: {e}")
+                return pd.DataFrame()
+            if "date" not in df_all.columns:
+              print("Missing 'date' column in DataFrame. Available columns:", list(df_all.columns))
+              return pd.DataFrame()
+
+            df_all["date"] = pd.to_datetime(df_all["date"])
 
 
     if unit == "city":
