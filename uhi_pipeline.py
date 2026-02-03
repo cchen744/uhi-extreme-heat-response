@@ -208,11 +208,8 @@ def make_daily_table(
     # OPTIMIZATION#1: Combine Mean/Median with Count into a single Reducer
     # This reduces the number of reduceRegion calls by half.
     base_reducer = ee.Reducer.mean() if agg_func == "mean" else ee.Reducer.median()
-    stat_name = "val"
-    
-    # Output keys will be: {band}_{val} and {band}_{cnt}
-    combined_reducer = base_reducer.setOutputs([stat_name]).combine(
-        reducer2=ee.Reducer.count().setOutputs(["cnt"]),
+    combined_reducer = base_reducer.combine(
+        reducer2=ee.Reducer.count(),
         sharedInputs=True
     )
 
@@ -238,9 +235,9 @@ def make_daily_table(
             maxPixels=1e13
         )
         
-        # Construct Output Keys based on setOutputs
-        key_val = f"{lst_band}_{stat_name}"
-        key_cnt = f"{lst_band}_cnt"
+        # Construct Output Keys based on default reducer outputs
+        key_val = f"{lst_band}_{agg_func}"
+        key_cnt = f"{lst_band}_count"
 
         return ee.Feature(None, {
             "date": date,
@@ -288,14 +285,13 @@ def make_daily_table_cells(
 
     # 3) Combined reducer: mean/median + count in one pass (same as city-level)
     base_reducer = ee.Reducer.mean() if agg_func == "mean" else ee.Reducer.median()
-    stat_name = "val"
-    combined_reducer = base_reducer.setOutputs([stat_name]).combine(
-        reducer2=ee.Reducer.count().setOutputs(["cnt"]),
+    combined_reducer = base_reducer.combine(
+        reducer2=ee.Reducer.count(),
         sharedInputs=True
     )
 
-    key_val = f"{lst_band}_{stat_name}"
-    key_cnt = f"{lst_band}_cnt"
+    key_val = f"{lst_band}_{agg_func}"
+    key_cnt = f"{lst_band}_count"
 
     def agg(img):
         # 4) Attach a date string to every output row (per day)
@@ -448,71 +444,71 @@ def run_city(
             return fc_list_local, month_ranges_local
 
 
-            fc_list, month_ranges = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)  
+    fc_list, month_ranges = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)  
             
 
-            if not fc_list:
-              return pd.DataFrame()
-          
-            fc_all = ee.FeatureCollection(fc_list).flatten()
-            fc_all_size = fc_all.size().getInfo()
-            if fc_all_size == 0:
-              if relax_filters_on_empty:
-                relaxed_urban_px = 1
-                relaxed_rural_px = 1
-                relaxed_cell_px = 1
-                print(
-                  "No features returned after filtering. Retrying with relaxed pixel thresholds: "
-                  f"urban>={relaxed_urban_px}, rural>={relaxed_rural_px}, cell>={relaxed_cell_px}."
-                )
-                fc_list, month_ranges = build_fc_list(relaxed_urban_px, relaxed_rural_px, relaxed_cell_px)
-                fc_all = ee.FeatureCollection(fc_list).flatten()
-                fc_all_size = fc_all.size().getInfo()
-              if fc_all_size == 0:
-                print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
-                if debug:
-                  print("Monthly feature counts after filtering:")
-                  for (s, e), fc in zip(month_ranges, fc_list):
-                    monthly_size = fc.size().getInfo()
-                    print(f"  {s} to {e}: {monthly_size}")
-                  print(
-                    "Consider lowering min_urban_pixels/min_rural_pixels "
-                    "(or min_cell_pixels for unit='cell') or expanding date/AOI filters."
-                  )
-                return pd.DataFrame()
+    if not fc_list:
+      return pd.DataFrame()
+  
+    fc_all = ee.FeatureCollection(fc_list).flatten()
+    fc_all_size = fc_all.size().getInfo()
+    if fc_all_size == 0:
+      if relax_filters_on_empty:
+        relaxed_urban_px = 1
+        relaxed_rural_px = 1
+        relaxed_cell_px = 1
+        print(
+          "No features returned after filtering. Retrying with relaxed pixel thresholds: "
+          f"urban>={relaxed_urban_px}, rural>={relaxed_rural_px}, cell>={relaxed_cell_px}."
+        )
+        fc_list, month_ranges = build_fc_list(relaxed_urban_px, relaxed_rural_px, relaxed_cell_px)
+        fc_all = ee.FeatureCollection(fc_list).flatten()
+        fc_all_size = fc_all.size().getInfo()
+      if fc_all_size == 0:
+        print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
+        if debug:
+          print("Monthly feature counts after filtering:")
+          for (s, e), fc in zip(month_ranges, fc_list):
+            monthly_size = fc.size().getInfo()
+            print(f"  {s} to {e}: {monthly_size}")
+          print(
+            "Consider lowering min_urban_pixels/min_rural_pixels "
+            "(or min_cell_pixels for unit='cell') or expanding date/AOI filters."
+          )
+        return pd.DataFrame()
 
-            fc_all_size = fc_all.size().getInfo()
-            if fc_all_size == 0:
-              print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
-              return pd.DataFrame()
+    fc_all_size = fc_all.size().getInfo()
+    if fc_all_size == 0:
+      print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
+      return pd.DataFrame()
 
-            if export_to_drive:
-              desc = export_desc or f"UHI_{ua_name or ua_contains or 'city'}"
-              task = ee.batch.Export.table.toDrive(
-                collection=fc_all,
-                description=desc,
-                fileFormat="CSV",
-                fileNamePrefix=desc,
-                folder=export_folder
-              )
-              task.start()
-              return None
+    if export_to_drive:
+      desc = export_desc or f"UHI_{ua_name or ua_contains or 'city'}"
+      task = ee.batch.Export.table.toDrive(
+        collection=fc_all,
+        description=desc,
+        fileFormat="CSV",
+        fileNamePrefix=desc,
+        folder=export_folder
+      )
+      task.start()
+      return None
 
-            # Optimized: Try to fetch data. 
-            # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
-            try:
-                df_all = geemap.ee_to_df(fc_all)
-                print("df_all columns:", list(df_all.columns))
-                print("df_all shape:", df_all.shape)
-                print(df_all.empty)
-            except Exception as e:
-                print(f"Error fetching data: {e}")
-                return pd.DataFrame()
-            if "date" not in df_all.columns:
-              print("Missing 'date' column in DataFrame. Available columns:", list(df_all.columns))
-              return pd.DataFrame()
+    # Optimized: Try to fetch data. 
+    # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
+    try:
+        df_all = geemap.ee_to_df(fc_all)
+        print("df_all columns:", list(df_all.columns))
+        print("df_all shape:", df_all.shape)
+        print(df_all.empty)
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return pd.DataFrame()
+    if "date" not in df_all.columns:
+      print("Missing 'date' column in DataFrame. Available columns:", list(df_all.columns))
+      return pd.DataFrame()
 
-            df_all["date"] = pd.to_datetime(df_all["date"])
+    df_all["date"] = pd.to_datetime(df_all["date"])
 
 
     if unit == "city":
