@@ -445,7 +445,9 @@ def run_city(
 
 
     fc_list, month_ranges = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)  
-            
+    # checkpoint 1
+    print("fc_list length:", len(fc_list))
+    print("first fc size:", fc_list[0].size().getInfo())     
 
     if not fc_list:
       return pd.DataFrame()
