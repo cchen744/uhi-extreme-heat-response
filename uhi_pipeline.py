@@ -236,7 +236,7 @@ def make_daily_table(
         )
         
         # Construct Output Keys based on default reducer outputs
-        key_val = f"{lst_band}_{agg_func}"
+        key_val = f"{lst_band}_mean" if agg_func == "mean" else f"{lst_band}_median"
         key_cnt = f"{lst_band}_count"
 
         return ee.Feature(None, {
