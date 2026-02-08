@@ -290,8 +290,8 @@ def make_daily_table_cells(
         sharedInputs=True
     )
 
-    key_val = f"{lst_band}_mean" if agg_func == "mean" else f"{lst_band}_median"
-    key_cnt = f"{lst_band}_count"
+    key_val = agg_func      # "mean" or "median"
+    key_cnt = "count"
 
     def agg(img):
         # 4) Attach a date string to every output row (per day)
