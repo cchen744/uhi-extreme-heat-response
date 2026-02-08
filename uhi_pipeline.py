@@ -290,8 +290,8 @@ def make_daily_table_cells(
         sharedInputs=True
     )
 
-    key_val = agg_func      # "mean" or "median"
-    key_cnt = "count"
+    key_val = f"{lst_band}_mean" if agg_func == "mean" else f"{lst_band}_median"
+    key_cnt = f"{lst_band}_count"
 
     def agg(img):
         # 4) Attach a date string to every output row (per day)
@@ -308,8 +308,9 @@ def make_daily_table_cells(
             scale=lst_scale_m,
             maxPixels=1e13
         )
-        lst_rur = rur_stats.get(key_val)
-        rural_n = rur_stats.get(key_cnt)
+        
+        lst_rur = ee.Algorithms.If(rur_stats.contains(key_val), rur_stats.get(key_val), None)
+        rural_n = ee.Algorithms.If(rur_stats.contains(key_cnt), rur_stats.get(key_cnt), 0)
 
         # 7) Urban is reduced per grid cell (many values per day)
         #    reduceRegions returns a FeatureCollection with stats per feature geometry.
