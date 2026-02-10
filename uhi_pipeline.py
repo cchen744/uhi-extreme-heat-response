@@ -77,66 +77,6 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
 
     return urban_region, rural_region, urban_mask, rural_mask
 
-# ====== UPDATE: added grid cell generator (1km x 1km, fishnet) ========
-# ------------------------------------------------------------------
-# 4. project urban area to crs and generate fishnet on 1km x 1km
-# ------------------------------------------------------------------
-# def make_grid_fc(region_geom, cell_size_m=1000, crs="EPSG:3857",err_m=100):
-#     """
-#     Create a square grid (cell_size_m x cell_size_m) covering region_geom.
-#     Returns ee.FeatureCollection with properties: cell_id, x, y
-#     """
-#     # 1) Reproject region to a metric CRS so bounds are in meters
-#     region_proj = region_geom.transform(crs, 1)
-
-#     # 2) Get bounding box in projected coordinates
-#     bounds = region_geom.bounds(ee.ErrorMargin(err_m)).transform(crs, 1)
-
-#     ring = ee.List(bounds.coordinates().get(0)) # list of [x,y]
-#     # robust min/max across all ring points (no index assumptions)
-#     xs = ring.map(lambda p: ee.Number(ee.List(p).get(0)))
-#     ys = ring.map(lambda p: ee.Number(ee.List(p).get(1)))
-
-#     xmin = ee.Number(xs.reduce(ee.Reducer.min()))
-#     xmax = ee.Number(xs.reduce(ee.Reducer.max()))
-#     ymin = ee.Number(ys.reduce(ee.Reducer.min()))
-#     ymax = ee.Number(ys.reduce(ee.Reducer.max()))
-
-#     # 3) Generate x/y sequences
-#     xs = ee.List.sequence(xmin, xmax.subtract(cell_size_m), cell_size_m)
-#     ys = ee.List.sequence(ymin, ymax.subtract(cell_size_m), cell_size_m)
-
-#     # hard cap for check
-#     xs_seq = ee.List.sequence(xmin, xmin.add(cell_size_m * 5), cell_size_m)
-#     ys_seq = ee.List.sequence(ymin, ymin.add(cell_size_m * 5), cell_size_m)
-
-
-#     # 4) Build rectangles and keep only those intersecting the region
-#     def make_row(y):
-#         y = ee.Number(y)
-#         def make_cell(x):
-#           x = ee.Number(x)
-#           cell = ee.Geometry.Rectangle([x, y, x.add(cell_size_m), y.add(cell_size_m)], crs, False)
-            
-#           inter = cell.intersects(region_proj, ee.ErrorMargin(err_m))
-
-#           cell_clip = ee.Geometry(
-#                 ee.Algorithms.If(
-#                 inter,
-#                 cell.intersection(region_proj, ee.ErrorMargin(err_m)),
-#                 cell
-#                     )
-#                       )
-#           cell_id = ee.String(x.format("%.0f")).cat("_").cat(y.format("%.0f"))
-#           return ee.Feature(cell_clip, {"cell_id": cell_id, "x": x, "y": y}).set("keep", inter)
-        
-#         row_features = xs.map(make_cell) 
-#         return ee.FeatureCollection(row_features)
-    
-#     grid_fc = ee.FeatureCollection(ys.map(make_row)).flatten() # changed from ys to ys_seq
-#     grid_fc = grid_fc.filter(ee.Filter.eq("keep", True)).select(["cell_id", "x", "y"])
-#     return grid_fc
-
 # ================ Here we use ReduceToVector to simplify the grid cell geenration ============
 def make_grid_fc_2(region_geom, cell_size_m=1000, crs="EPSG:3857", err_m=100):
     """
@@ -293,6 +233,10 @@ def make_daily_table_cells(
     key_val = agg_func      # "mean" or "median"
     key_cnt = "count"
 
+    # new：rural reduceRegion
+    rur_key_val_band = f"{lst_band}_{agg_func}"   # e.g. LST_Night_1km_mean
+    rur_key_cnt_band = f"{lst_band}_count"        # e.g. LST_Night_1km_count
+
     def agg(img):
         # 4) Attach a date string to every output row (per day)
         date = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
@@ -309,8 +253,17 @@ def make_daily_table_cells(
             maxPixels=1e13
         )
         
-        lst_rur = ee.Algorithms.If(rur_stats.contains(key_val), rur_stats.get(key_val), None)
-        rural_n = ee.Algorithms.If(rur_stats.contains(key_cnt), rur_stats.get(key_cnt), 0)
+        lst_rur = ee.Algorithms.If(
+          rur_stats.contains(rur_key_val_band),
+          rur_stats.get(rur_key_val_band),
+          ee.Algorithms.If(rur_stats.contains(key_val), rur_stats.get(key_val), None)
+        )
+
+        rural_n = ee.Algorithms.If(
+            rur_stats.contains(rur_key_cnt_band),
+            rur_stats.get(rur_key_cnt_band),
+            ee.Algorithms.If(rur_stats.contains(key_cnt), rur_stats.get(key_cnt), 0)
+        )
 
         # 7) Urban is reduced per grid cell (many values per day)
         #    reduceRegions returns a FeatureCollection with stats per feature geometry.
