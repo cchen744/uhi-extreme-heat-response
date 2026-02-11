@@ -78,52 +78,75 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
     return urban_region, rural_region, urban_mask, rural_mask
 
 # ================ Here we use ReduceToVector to simplify the grid cell geenration ============
-def make_grid_fc_2(region_geom, cell_size_m=1000, crs="EPSG:3857", err_m=100):
+def make_grid_fc_2(region_geom, cell_size_m=1000, crs="EPSG:3857", err_m=100, tileScale=4):
     """
     Build 1km x 1km fishnet polygons in a metric CRS using reduceToVectors.
     Much more stable than List.sequence + map + flatten.
     """
     # 1) Bounds in target CRS (meters)
     bounds = region_geom.bounds(ee.ErrorMargin(err_m)).transform(crs, 1)
+    region_proj = region_geom.transform(crs, 1)
 
     # 2) Create a constant image in the desired projection/scale
     proj = ee.Projection(crs).atScale(cell_size_m)
-    img = ee.Image.constant(1).reproject(proj)
+    pc = ee.Image.pixelCoordinates(proj)
+    x = pc.select("x").toInt()
+    y = pc.select("y").toInt()
+
+    # Build a per-pixel unique-ish id so adjacent pixels won't merge.
+    # (Use a big multiplier; safe for typical WebMercator meter ranges.)
+    pid = x.multiply(100000000).add(y).rename("pid")
+
+    #vadd a dummy value band so Reducer.first has something to reduce
+    img2 = pid.addBands(ee.Image.constant(1).rename("v"))
 
     # 3) Vectorize pixels inside bounds -> grid polygons
-    grid = img.reduceToVectors(
+    grid = img2.reduceToVectors(
         geometry=bounds,
         scale=cell_size_m,
         geometryType="polygon",
-        reducer=ee.Reducer.countEvery(),
-        maxPixels=1e13
+        crs=crs,
+        labelProperty="pid", 
+        reducer=ee.Reducer.first(),
+        maxPixels=1e13,
+        tileScale=tileScale
     )
 
-    region_proj = region_geom.transform(crs, 1)
+    
+    grid = grid.filterBounds(region_proj)
 
-    # 4) Clip each cell to the city and create a stable-ish cell_id from centroid coords
-    def post(ft):
-        ft = ee.Feature(ft)
-        geom = ft.geometry()
-        inter = geom.intersects(region_proj, ee.ErrorMargin(err_m))
-        geom_clip = ee.Geometry(
-            ee.Algorithms.If(
-                inter,
-                geom.intersection(region_proj, ee.ErrorMargin(err_m)),
-                geom
-            )
-        )
 
-        # centroid in CRS -> use rounded meters as id components
-        c = geom.centroid(ee.ErrorMargin(err_m)).transform(crs, 1).coordinates()
-        x = ee.Number(ee.List(c).get(0)).round()
-        y = ee.Number(ee.List(c).get(1)).round()
-        cell_id = x.format('%.0f').cat('_').cat(y.format('%.0f'))
+    # # 4) Clip each cell to the city and create a stable-ish cell_id from centroid coords
+    # def post(ft):
+    #     ft = ee.Feature(ft)
+    #     geom = ft.geometry()
+    #     inter = geom.intersects(region_proj, ee.ErrorMargin(err_m))
+    #     geom_clip = ee.Geometry(
+    #         ee.Algorithms.If(
+    #             inter,
+    #             geom.intersection(region_proj, ee.ErrorMargin(err_m)),
+    #             geom
+    #         )
+    #     )
 
-        return ee.Feature(geom_clip, {"cell_id": cell_id}).set("keep", inter)
+    #     # centroid in CRS -> use rounded meters as id components
+    #     c = geom.centroid(ee.ErrorMargin(err_m)).transform(crs, 1).coordinates()
+    #     x = ee.Number(ee.List(c).get(0)).round()
+    #     y = ee.Number(ee.List(c).get(1)).round()
+    #     cell_id = x.format('%.0f').cat('_').cat(y.format('%.0f'))
 
-    grid = grid.map(post).filter(ee.Filter.eq("keep", True)).select(["cell_id"])
-    return grid
+    #     return ee.Feature(geom_clip, {"cell_id": cell_id}).set("keep", inter)
+    
+    # give every cell a stable cell_id using its centroid in "EPSG:3857"
+    def add_id(ft):
+      ft = ee.Feature(ft)
+      c = ft.geometry().centroid(ee.ErrorMargin(err_m)).transform(crs, 1).coordinates()
+      x = ee.Number(ee.List(c).get(0)).round()
+      y = ee.Number(ee.List(c).get(1)).round()
+      cell_id = x.format('%.0f').cat('_').cat(y.format('%.0f'))
+      return ft.set({"cell_id": cell_id})
+
+    return grid.map(add_id).select(["cell_id"])
 
 
 # ------------------------------------------------------------------
