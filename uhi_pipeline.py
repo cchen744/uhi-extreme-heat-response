@@ -233,7 +233,7 @@ def make_monthly_table_cells(
         # *   Running on a single monthly mean image is much faster than running
         # *   reduceToVectors on every day individually.
         urb_cells = (
-            urb.addBands(cell_id_img)
+            cell_id_img.addBands(urb)
                .reduceToVectors(
                    geometry=bounds,
                    scale=cell_scale_m,
@@ -377,7 +377,7 @@ def run_city(
             else:
                 raise ValueError("unit must be 'city' or 'cell'")
             
-            return fc_list_local, month_ranges_local
+          return fc_list_local, month_ranges_local
 
     fc_list, month_ranges = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)  
     print("fc_list length:", len(fc_list))
