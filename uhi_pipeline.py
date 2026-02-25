@@ -237,7 +237,7 @@ def make_monthly_table_cells(
                .reduceToVectors(
                    geometry=bounds,
                    scale=cell_scale_m,
-                   geometryType="polygon",
+                   geometryType="centroid",
                    crs=crs,
                    labelProperty="cell_id",
                    reducer=combined,
@@ -251,7 +251,15 @@ def make_monthly_table_cells(
         def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _month=month_str):
             lst_urb  = ft.get(f"{lst_band}_mean")
             # * delta_uhi computed server-side so the exported CSV is analysis-ready
-            delta    = ee.Number(lst_urb).subtract(ee.Number(_lst_rur))
+            delta = ee.Algorithms.If(
+                ee.Algorithms.IsEqual(lst_urb, None),
+                None,
+                ee.Algorithms.If(
+                    ee.Algorithms.IsEqual(_lst_rur, None),
+                    None,
+                    ee.Number(lst_urb).subtract(ee.Number(_lst_rur))
+                )
+            )
             return ft.set({
                 "month":        _month,
                 "LST_urb_cell": lst_urb,
@@ -329,13 +337,12 @@ def run_city(
 
     def build_fc_list(min_urban_px, min_rural_px, min_cell_px):
           fc_list_local = []
-          month_ranges_local = []
-          for s, e in month_starts(start_date, end_date):
-            month_ranges_local.append((s, e))
-            
-            if unit == 'city':
+          range_labels_local = []
+
+          if unit == 'city':
+              # Keep city output at daily resolution for extreme-day analysis.
               fc = make_daily_table(
-                  s, e,
+                  start_date, end_date,
                   urban_region, rural_region,
                   urban_mask, rural_mask,
                   lst_band, qc_band,
@@ -348,46 +355,48 @@ def run_city(
               fc = fc.filter(ee.Filter.gte("urban_n", min_urban_px))
               fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
               fc = fc.select(["date", "LST_urb", "LST_rur", "urban_n", "rural_n"])
-            
-            elif unit == "cell":
-                # * MODIFIED: replaced make_daily_table_cells (day × cell) with
-                # *           make_monthly_table_cells (month × cell).
-                # *           The entire date range is handled in one call;
-                # *           monthly iteration is done inside make_monthly_table_cells.
-                fc = make_monthly_table_cells(
-                    start_date, end_date,
-                    urban_region, rural_region,
-                    urban_mask, rural_mask,
-                    lst_band, qc_band,
-                    lst_scale_m=lst_scale_m,
-                    cell_scale_m=cell_scale_m,
-                    crs=cell_crs
-                )
-                fc = ee.FeatureCollection(fc)
-                fc = fc.filter(ee.Filter.notNull(["month", "cell_id", "LST_urb_cell",
-                                                    "cell_n", "LST_rur", "rural_n", "delta_uhi"]))
-                fc = fc.filter(ee.Filter.gte("cell_n", min_cell_px))
-                fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
-                fc = fc.select(["month", "cell_id", "LST_urb_cell", "cell_n",
-                                  "LST_rur", "rural_n", "delta_uhi"])
-                # * wrap in list to keep the rest of run_city's flattening logic intact
-                fc_list_local.append(fc)
-                month_ranges_local.append((start_date, end_date))
+              fc_list_local.append(fc)
+              range_labels_local.append((start_date, end_date))
 
-            else:
-                raise ValueError("unit must be 'city' or 'cell'")
-            
-          return fc_list_local, month_ranges_local
+          elif unit == "cell":
+              # * MODIFIED: replaced make_daily_table_cells (day × cell) with
+              # *           make_monthly_table_cells (month × cell).
+              fc = make_monthly_table_cells(
+                  start_date, end_date,
+                  urban_region, rural_region,
+                  urban_mask, rural_mask,
+                  lst_band, qc_band,
+                  lst_scale_m=lst_scale_m,
+                  cell_scale_m=cell_scale_m,
+                  crs=cell_crs
+              )
+              fc = ee.FeatureCollection(fc)
+              fc = fc.filter(ee.Filter.notNull(["month", "cell_id", "LST_urb_cell",
+                                                "cell_n", "LST_rur", "rural_n", "delta_uhi"]))
+              fc = fc.filter(ee.Filter.gte("cell_n", min_cell_px))
+              fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
+              fc = fc.select(["month", "cell_id", "LST_urb_cell", "cell_n",
+                              "LST_rur", "rural_n", "delta_uhi"])
+              fc_list_local.append(fc)
+              range_labels_local.append((start_date, end_date))
 
-    fc_list, month_ranges = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)  
+          else:
+              raise ValueError("unit must be 'city' or 'cell'")
+
+          return fc_list_local, range_labels_local
+
+    fc_list, range_labels = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)           
+  
     print("fc_list length:", len(fc_list))
-    print("first fc size:", fc_list[0].size().getInfo())     
+   
 
     if not fc_list:
       return pd.DataFrame()
-  
+    print("first fc size:", fc_list[0].size().getInfo())
+
     fc_all = ee.FeatureCollection(fc_list).flatten()
     fc_all_size = fc_all.size().getInfo()
+
     if fc_all_size == 0:
       if relax_filters_on_empty:
         relaxed_urban_px = 1
@@ -397,16 +406,16 @@ def run_city(
           "No features returned after filtering. Retrying with relaxed pixel thresholds: "
           f"urban>={relaxed_urban_px}, rural>={relaxed_rural_px}, cell>={relaxed_cell_px}."
         )
-        fc_list, month_ranges = build_fc_list(relaxed_urban_px, relaxed_rural_px, relaxed_cell_px)
+        fc_list, range_labels = build_fc_list(relaxed_urban_px, relaxed_rural_px, relaxed_cell_px)
         fc_all = ee.FeatureCollection(fc_list).flatten()
         fc_all_size = fc_all.size().getInfo()
       if fc_all_size == 0:
         print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
         if debug:
-          print("Monthly feature counts after filtering:")
-          for (s, e), fc in zip(month_ranges, fc_list):
-            monthly_size = fc.size().getInfo()
-            print(f"  {s} to {e}: {monthly_size}")
+          print("Feature counts after filtering:")
+          for (s, e), fc in zip(range_labels, fc_list):
+            feature_count = fc.size().getInfo()
+            print(f"  {s} to {e}: {feature_count}")
           print(
             "Consider lowering min_urban_pixels/min_rural_pixels "
             "(or min_cell_pixels for unit='cell') or expanding date/AOI filters."
@@ -440,14 +449,12 @@ def run_city(
     except Exception as e:
         print(f"Error fetching data: {e}")
         return pd.DataFrame()
-    if "date" not in df_all.columns:
-      print("Missing 'date' column in DataFrame. Available columns:", list(df_all.columns))
-      return pd.DataFrame()
-
-    df_all["date"] = pd.to_datetime(df_all["date"])
-
 
     if unit == "city":
+      if "date" not in df_all.columns:
+        print("Missing 'date' column in DataFrame. Available columns:", list(df_all.columns))
+        return pd.DataFrame()
+      df_all["date"] = pd.to_datetime(df_all["date"])
       df_all = df_all.drop_duplicates(subset=["date"]).reset_index(drop=True)
       df_all["SUHI"] = df_all["LST_urb"] - df_all["LST_rur"]
 
