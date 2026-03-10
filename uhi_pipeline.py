@@ -225,8 +225,8 @@ def make_monthly_table_cells(
             scale=lst_scale_m,
             maxPixels=1e13
         )
-        lst_rur = rur_stats.get(f"{lst_band}_mean")
-        rural_n = rur_stats.get(f"{lst_band}_count")
+        lst_rur = rur_stats.get(f"mean")
+        rural_n = rur_stats.get(f"count")
 
         # * Step 3: urban cells — reduceToVectors on the monthly mean image.
         # *   Inlines the old make_grid_fc_2 + reduceRegions two-step into one call.
@@ -237,7 +237,7 @@ def make_monthly_table_cells(
                .reduceToVectors(
                    geometry=bounds,
                    scale=cell_scale_m,
-                   geometryType="centroid",
+                   geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
                    crs=crs,
                    labelProperty="cell_id",
                    reducer=combined,
@@ -247,9 +247,16 @@ def make_monthly_table_cells(
                .filterBounds(region_proj)
         )
 
+        # tempotary debugging
+        print("month:", month_str)
+        print("urb_cells size:", urb_cells.size().getInfo())
+        print("urb_cells first props:", urb_cells.first().propertyNames().getInfo())
+        print("urb_cells first dict:", urb_cells.first().toDictionary().getInfo())
+
         # * Step 4: attach month, rural reference, and delta_uhi to each cell feature
         def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _month=month_str):
-            lst_urb  = ft.get(f"{lst_band}_mean")
+            lst_rur = rur_stats.get(f"{lst_band}_mean")
+            rural_n = rur_stats.get(f"{lst_band}_count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
             # * delta_uhi computed server-side so the exported CSV is analysis-ready
             delta = ee.Algorithms.If(
                 ee.Algorithms.IsEqual(lst_urb, None),
@@ -263,7 +270,7 @@ def make_monthly_table_cells(
             return ft.set({
                 "month":        _month,
                 "LST_urb_cell": lst_urb,
-                "cell_n":       ft.get(f"{lst_band}_count"),
+                "cell_n":       cell_n,
                 "LST_rur":      _lst_rur,
                 "rural_n":      _rural_n,
                 "delta_uhi":    delta,
