@@ -79,7 +79,7 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
     inner = city_geom.buffer(ring_inner_m)
     rural_region = outer.difference(inner)
 
-    urban_mask = is_water.Not().clip(urban_region)
+    urban_mask = is_built.clip(urban_region)
     rural_mask = is_natural.clip(rural_region)
 
     return urban_region, rural_region, urban_mask, rural_mask
@@ -147,23 +147,7 @@ def make_daily_table(
 
     return ic.map(agg)
 
-# ------------------------------------------------------------------
-# * 5. NEW FUNCTION: make_monthly_table_cells
-# * Replaces make_grid_fc_2 + make_daily_table_cells entirely.
-# *
-# * Key design decisions:
-# *   1. Monthly mean is computed in GEE (ImageCollection.mean()) before
-# *      vectorizing, so reduceToVectors runs once per month, not once per day.
-# *   2. Grid generation (pixelCoordinates → reduceToVectors) is inlined here
-# *      and applied directly to the masked monthly mean image, eliminating
-# *      the separate make_grid_fc_2 → reduceRegions two-step.
-# *   3. delta_uhi = LST_urb_cell - LST_rur is computed server-side before
-# *      export, so the output table is immediately analysis-ready.
-# *   4. Output shape: (n_months × n_cells) instead of (n_days × n_cells),
-# *      e.g. ~7k rows vs ~220k rows for Phoenix/1yr/500m.
-# ------------------------------------------------------------------
-
-def make_monthly_table_cells(
+def make_daily_table_cells(
     start_date, end_date,
     urban_region, rural_region,
     urban_mask, rural_mask,
@@ -175,14 +159,14 @@ def make_monthly_table_cells(
     tileScale=4
 ):
     """
-    Returns a FeatureCollection with one feature per (month, cell):
-        month        | YYYY-MM string
-        cell_id      | integer pixel coordinate hash (x * 1e8 + y), stable across months
-        LST_urb_cell | monthly mean urban LST for this cell (°C)
+    Returns a FeatureCollection with one image per (date, cell):
+        date        | YYYY-MM-dd string
+        cell_id      | integer pixel coordinate hash (x * 1e8 + y), stable across days
+        LST_urb_cell | daily mean urban LST for this cell (°C)
         cell_n       | number of valid MODIS pixels averaged into LST_urb_cell
-        LST_rur      | monthly mean rural LST for the city (°C), one value per month
+        LST_rur      | daily mean rural LST for the city (°C), one value one day
         rural_n      | number of valid MODIS pixels averaged into LST_rur
-        delta_uhi    | LST_urb_cell - LST_rur (°C)
+        uhi    | LST_urb_cell - LST_rur (°C)
     """
     # * Precompute grid geometry constants (shared across all months)
     proj       = ee.Projection(crs).atScale(cell_scale_m)
@@ -190,97 +174,95 @@ def make_monthly_table_cells(
     # * cell_id image: integer hash of pixel (x, y) coordinates — unique and stable
     cell_id_img = (
         pc.select("x").toInt()
-          .multiply(-100000000)
+          .multiply(100000000)
           .add(pc.select("y").toInt())
           .rename("cell_id")
     )
     bounds      = urban_region.bounds(ee.ErrorMargin(err_m)).transform(crs, 1)
-    region_proj = urban_region.transform(crs, 1)
+    region_proj = urban_region.transform(crs, 1).simplify(cell_scale_m / 2)
 
     # * Combined reducer: mean + count in a single pass
     combined = ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True)
 
-    monthly_fcs = []  # * collect one FC per month, flatten at the end
+    # * Step 1: collapse all valid daily images in this month to a single mean image
+    daily_ics = (
+        ee.ImageCollection("MODIS/061/MYD11A1")
+        .filterBounds(urban_region)
+        .filterDate(start_date, end_date)
+        .select([lst_band, qc_band])
+        .map(lambda img: clean_lst(img, lst_band, qc_band))
+        # * temporal mean across days — reduces compute vs per-day loop
+    )
 
-    for s, e in month_starts(start_date, end_date):
-        month_str = s[:7]   # * "YYYY-MM"
+    daily_fc_list = [] # container of final output
+    img_list = daily_ics.toList(daily_ics.size()) # a list of daily images
 
-        # * Step 1: collapse all valid daily images in this month to a single mean image
-        monthly_mean = (
-            ee.ImageCollection("MODIS/061/MYD11A1")
-            .filterBounds(urban_region)
-            .filterDate(s, e)
-            .select([lst_band, qc_band])
-            .map(lambda img: clean_lst(img, lst_band, qc_band))
-            .mean()   # * temporal mean across days — reduces compute vs per-day loop
-        )
+    def single_img_processer(img):
+      '''
+      for each image, generate a grided imge with uhi in each grid cell
+      '''
+      date_str = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
+      urb = img.updateMask(urban_mask)
+      rur = img.updateMask(rural_mask)
 
-        urb = monthly_mean.updateMask(urban_mask)
-        rur = monthly_mean.updateMask(rural_mask)
+      # * Step 1: rural reference — one scalar per month (cheap reduceRegion)
+      rur_stats = rur.reduceRegion(
+        reducer=combined,
+        geometry=rural_region,
+        scale=lst_scale_m,
+        maxPixels=1e13
+    )
+      lst_rur = rur_stats.get(f"{lst_band}_mean")
+      rural_n = rur_stats.get(f"{lst_band}_count")
 
-        # * Step 2: rural reference — one scalar per month (cheap reduceRegion)
-        rur_stats = rur.reduceRegion(
-            reducer=combined,
-            geometry=rural_region,
-            scale=lst_scale_m,
-            maxPixels=1e13
-        )
-        lst_rur = rur_stats.get(f"{lst_band}_mean")
-        rural_n = rur_stats.get(f"{lst_band}_count")
+      # * Step 2: urban cells — reduceToVectors on the daily image.
+      urb_cells = (
+          cell_id_img.addBands(urb)
+              .reduceToVectors(
+                  geometry=bounds,
+                  scale=cell_scale_m,
+                  geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
+                  crs=crs,
+                  labelProperty="cell_id",
+                  reducer=combined,
+                  maxPixels=1e13,
+                  tileScale=tileScale
+              )
+              .filterBounds(region_proj)
+      )
 
-        # * Step 3: urban cells — reduceToVectors on the monthly mean image.
-        # *   Inlines the old make_grid_fc_2 + reduceRegions two-step into one call.
-        # *   Running on a single monthly mean image is much faster than running
-        # *   reduceToVectors on every day individually.
-        urb_cells = (
-            cell_id_img.addBands(urb)
-               .reduceToVectors(
-                   geometry=bounds,
-                   scale=cell_scale_m,
-                   geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
-                   crs=crs,
-                   labelProperty="cell_id",
-                   reducer=combined,
-                   maxPixels=1e13,
-                   tileScale=tileScale
-               )
-               .filterBounds(region_proj)
-        )
+      # * Step 3: attach daily, rural reference, and uhi to each cell feature
+      def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _date=date_str):
+          lst_urb = ft.get("mean")
+          cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
+          # * uhi computed server-side so the exported CSV is analysis-ready
+          uhi = ee.Algorithms.If(
+              ee.Algorithms.IsEqual(lst_urb, None),
+              None,
+              ee.Algorithms.If(
+                  ee.Algorithms.IsEqual(_lst_rur, None),
+                  None,
+                  ee.Number(lst_urb).subtract(ee.Number(_lst_rur))
+              )
+          )
+          return ft.set({
+              "date":        _date,
+              "LST_urb_cell": lst_urb,
+              "cell_n":       cell_n,
+              "LST_rur":      _lst_rur,
+              "rural_n":      _rural_n,
+              "uhi":    uhi,
+          }).select(["date", "cell_id", "LST_urb_cell", "cell_n",
+                      "LST_rur", "rural_n", "uhi"])
+      return urb_cells.map(add_props)
 
-        # tempotary debugging
-        print("month:", month_str)
-        print("urb_cells size:", urb_cells.size().getInfo())
-        print("urb_cells first props:", urb_cells.first().propertyNames().getInfo())
-        print("urb_cells first dict:", urb_cells.first().toDictionary().getInfo())
+    n = daily_ics.size().getInfo()
 
-        # * Step 4: attach month, rural reference, and delta_uhi to each cell feature
-        def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _month=month_str):
-            lst_urb = ft.get("mean")
-            cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
-            # * delta_uhi computed server-side so the exported CSV is analysis-ready
-            delta = ee.Algorithms.If(
-                ee.Algorithms.IsEqual(lst_urb, None),
-                None,
-                ee.Algorithms.If(
-                    ee.Algorithms.IsEqual(_lst_rur, None),
-                    None,
-                    ee.Number(lst_urb).subtract(ee.Number(_lst_rur))
-                )
-            )
-            return ft.set({
-                "month":        _month,
-                "LST_urb_cell": lst_urb,
-                "cell_n":       cell_n,
-                "LST_rur":      _lst_rur,
-                "rural_n":      _rural_n,
-                "delta_uhi":    delta,
-            }).select(["month", "cell_id", "LST_urb_cell", "cell_n",
-                       "LST_rur", "rural_n", "delta_uhi"])
-
-        monthly_fcs.append(urb_cells.map(add_props))
-
-    # * Flatten list of monthly FCs into one FeatureCollection
-    return ee.FeatureCollection(monthly_fcs).flatten()
+    for i in range(n):
+      img = ee.Image(img_list.get(i))
+      daily_fc_list.append(single_img_processer(img))
+    
+    return ee.FeatureCollection(daily_fc_list).flatten()
 
 # ------------------------------------------------------------------
 # 6. Urban Area Selector
