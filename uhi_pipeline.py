@@ -64,25 +64,22 @@ def clean_lst(img, lst_band, qc_band):
 # 3. Build urban / rural masks (UA + LCZ)
 # ------------------------------------------------------------------
 def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
-    lcz_img = ee.ImageCollection("RUB/RUBCLIM/LCZ/global_lcz_map/latest").first()
-    lcz = lcz_img.select("LCZ_Filter")
+    # lcz_img = ee.ImageCollection("RUB/RUBCLIM/LCZ/global_lcz_map/latest").first()
+    # lcz = lcz_img.select("LCZ_Filter")
 
-    BUILT_MIN, BUILT_MAX = 1, 10
-    WATER_CODE = 17
+    # BUILT_MIN, BUILT_MAX = 1, 10
+    # WATER_CODE = 17
 
-    is_built = lcz.gte(BUILT_MIN).And(lcz.lte(BUILT_MAX))
-    is_water = lcz.eq(WATER_CODE)
-    is_natural = is_built.Not().And(is_water.Not())
+    # is_built = lcz.gte(BUILT_MIN).And(lcz.lte(BUILT_MAX))
+    # is_water = lcz.eq(WATER_CODE)
+    # is_natural = is_built.Not().And(is_water.Not())
 
     urban_region = city_geom
     outer = city_geom.buffer(ring_outer_m)
     inner = city_geom.buffer(ring_inner_m)
     rural_region = outer.difference(inner)
 
-    urban_mask = is_built.clip(urban_region)
-    rural_mask = is_natural.clip(rural_region)
-
-    return urban_region, rural_region, urban_mask, rural_mask
+    return urban_region, rural_region
 
 # ------------------------------------------------------------------
 # 4. Daily aggregation (UA x day) - OPTIMIZED
@@ -90,7 +87,6 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
 def make_daily_table(
     start, end,
     urban_region, rural_region,
-    urban_mask, rural_mask,
     lst_band, qc_band,
     agg_func="mean",
     lst_scale_m=1000
@@ -114,8 +110,8 @@ def make_daily_table(
     def agg(img):
         date = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
 
-        urb = img.updateMask(urban_mask)
-        rur = img.updateMask(rural_mask)
+        urb = img.clip(urban_region)
+        rur = img.clip(rural_region)
 
         # 1. Urban Reduction (Both Stats at once)
         urb_stats = urb.reduceRegion(
@@ -150,7 +146,6 @@ def make_daily_table(
 def make_daily_table_cells(
     start_date, end_date,
     urban_region, rural_region,
-    urban_mask, rural_mask,
     lst_band, qc_band,
     lst_scale_m=1000,
     cell_scale_m=1000,       # * grid resolution in meters
@@ -202,8 +197,8 @@ def make_daily_table_cells(
       for each image, generate a grided imge with uhi in each grid cell
       '''
       date_str = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
-      urb = img.updateMask(urban_mask)
-      rur = img.updateMask(rural_mask)
+      urb = img.clip(urban_region)
+      rur = img.clip(rural_region)
 
       # * Step 1: rural reference — one scalar per month (cheap reduceRegion)
       rur_stats = rur.reduceRegion(
@@ -320,7 +315,7 @@ def run_city(
         raise ValueError("No UA matched your query.")
     city_geom = city_fc.geometry()
 
-    urban_region, rural_region, urban_mask, rural_mask = build_masks(
+    urban_region, rural_region = build_masks(
         city_geom, ring_outer_m, ring_inner_m
     )
 
@@ -333,7 +328,6 @@ def run_city(
               fc = make_daily_table(
                   start_date, end_date,
                   urban_region, rural_region,
-                  urban_mask, rural_mask,
                   lst_band, qc_band,
                   agg_func, lst_scale_m
               )
@@ -350,10 +344,9 @@ def run_city(
           elif unit == "cell":
               # * MODIFIED: replaced make_daily_table_cells (day × cell) with
               # *           make_monthly_table_cells (month × cell).
-              fc = make_monthly_table_cells(
+              fc = make_daily_table_cells(
                   start_date, end_date,
                   urban_region, rural_region,
-                  urban_mask, rural_mask,
                   lst_band, qc_band,
                   lst_scale_m=lst_scale_m,
                   cell_scale_m=cell_scale_m,
