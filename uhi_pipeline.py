@@ -178,6 +178,22 @@ def make_daily_table_cells(
 
     # * Combined reducer: mean + count in a single pass
     combined = ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True)
+    
+    dummy = ee.Image.constant(1).rename("dummy")
+    grid = (
+          cell_id_img.addBands(dummy)
+          .reduceToVectors(
+                  geometry=bounds,
+                  scale=cell_scale_m,
+                  geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
+                  crs=crs,
+                  labelProperty="cell_id",
+                  reducer=ee.Reducer.first(),
+                  maxPixels=1e13,
+                  tileScale=tileScale
+              )
+              .filterBounds(region_proj)
+      )
 
     # * Step 1: collapse all valid daily images in this month to a single mean image
     daily_ics = (
@@ -210,20 +226,15 @@ def make_daily_table_cells(
       lst_rur = rur_stats.get(f"{lst_band}_mean")
       rural_n = rur_stats.get(f"{lst_band}_count")
 
-      # * Step 2: urban cells — reduceToVectors on the daily image.
-      urb_cells = (
-          cell_id_img.addBands(urb)
-              .reduceToVectors(
-                  geometry=bounds,
-                  scale=cell_scale_m,
-                  geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
-                  crs=crs,
-                  labelProperty="cell_id",
-                  reducer=combined,
-                  maxPixels=1e13,
-                  tileScale=tileScale
-              )
-              .filterBounds(region_proj)
+      # * Step 2: urban cells —  on the daily image.
+      
+    
+      urb_cells = urb.reduceRegions(
+          collection=grid,
+          reducer=combined,
+          scale=lst_scale_m,
+          crs=img.projection(),
+          tileScale=tileScale
       )
 
       # * Step 3: attach daily, rural reference, and uhi to each cell feature
