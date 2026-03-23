@@ -185,7 +185,7 @@ def make_daily_table_cells(
           .reduceToVectors(
                   geometry=bounds,
                   scale=cell_scale_m,
-                  geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
+                  geometryType="polygon", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
                   crs=crs,
                   labelProperty="cell_id",
                   reducer=ee.Reducer.first(),
