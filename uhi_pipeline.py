@@ -226,8 +226,8 @@ def make_daily_table_cells(
               .filterBounds(region_proj)
       )
 
-      # * Step 3: attach daily, rural reference, and uhi to each cell feature
-      def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _date=date_str):
+     # * Step 3: attach daily, rural reference, and uhi to each cell feature
+	def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _date=date_str):
           lst_urb = ft.get("mean")
           cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
           # * uhi computed server-side so the exported CSV is analysis-ready
@@ -240,16 +240,19 @@ def make_daily_table_cells(
                   ee.Number(lst_urb).subtract(ee.Number(_lst_rur))
               )
           )
-          return ft.set({
+		return ft.set({
               "date":        _date,
               "LST_urb_cell": lst_urb,
               "cell_n":       cell_n,
               "LST_rur":      _lst_rur,
               "rural_n":      _rural_n,
               "uhi":    uhi,
-          }).select(["date", "cell_id", "LST_urb_cell", "cell_n",
-                      "LST_rur", "rural_n", "uhi"])
-      return urb_cells.map(add_props)
+          })
+          
+	fc = urb_cells.map(add_props)
+	fc = fc.select([ "date", "cell_id", "LST_urb_cell", "cell_n", "LST_rur", "rural_n", "uhi"])
+
+    return fc
 
     n = daily_ics.size().getInfo()
 
