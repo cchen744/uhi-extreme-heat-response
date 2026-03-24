@@ -267,8 +267,12 @@ def make_daily_table_cells(
     for i in range(n):
       img = ee.Image(img_list.get(i))
       daily_fc_list.append(single_img_processer(img))
-    
-    return ee.FeatureCollection(daily_fc_list).flatten()
+    # Fixing empty dataset:filterDate is silently dropping everything because features use a string 'date' property instead of system:time_start.
+    def add_time_start(feature):
+        date = ee.Date(feature.get('date'))
+        return feature.set('system:time_start', date.millis())
+    final_fc = ee.FeatureCollection(daily_fc_list).flatten()
+    return final_fc.map(add_time_start)
 
 # ------------------------------------------------------------------
 # 6. Urban Area Selector
