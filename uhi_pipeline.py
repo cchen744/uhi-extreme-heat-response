@@ -216,7 +216,7 @@ def make_daily_table_cells(
       urb = img.clip(urban_region)
       rur = img.clip(rural_region)
 
-      # * Step 1: rural reference — one scalar per month (cheap reduceRegion)
+      # * Step 1: rural reference — one scalar per day
       rur_stats = rur.reduceRegion(
         reducer=combined,
         geometry=rural_region,
@@ -224,7 +224,7 @@ def make_daily_table_cells(
         maxPixels=1e13
     )
       lst_rur = rur_stats.get(f"{lst_band}_mean")
-      rural_n = rur_stats.get(f"{lst_band}_count")
+      rural_cell_n = rur_stats.get(f"{lst_band}_count")
 
       # * Step 2: urban cells —  on the daily image.
       
@@ -238,9 +238,9 @@ def make_daily_table_cells(
       )
 
       # * Step 3: attach daily, rural reference, and uhi to each cell feature
-      def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _date=date_str):
-          lst_urb = ft.get("mean")
-          cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
+      def add_props(ft, _lst_rur=lst_rur, _rural_cell_n=rural_cell_n, _date=date_str):
+          lst_urb = ft.get(f"{lst_band}_mean")
+          urb_cell_n = ft.get(f"{lst_band}_count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
           # * uhi computed server-side so the exported CSV is analysis-ready
           uhi = ee.Algorithms.If(
               ee.Algorithms.IsEqual(lst_urb, None),
@@ -254,12 +254,12 @@ def make_daily_table_cells(
           return ft.set({
               "date":        _date,
               "LST_urb_cell": lst_urb,
-              "cell_n":       cell_n,
+              "urb_cell_n":       urb_cell_n,
               "LST_rur":      _lst_rur,
-              "rural_n":      _rural_n,
+              "rural_cell_n":      _rural_cell_n,
               "uhi":    uhi,
-          }).select(["date", "cell_id", "LST_urb_cell", "cell_n",
-                      "LST_rur", "rural_n", "uhi"])
+          }).select(["date", "cell_id", "LST_urb_cell", "urb_cell_n",
+                      "LST_rur", "rural_cell_n", "uhi"])
       return urb_cells.map(add_props)
 
     n = daily_ics.size().getInfo()
