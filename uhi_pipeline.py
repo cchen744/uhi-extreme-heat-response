@@ -1,13 +1,21 @@
 """
-Reusable SUHI data pipeline (GEE + MODIS LST)
-
-Optimized Version: GEE Cell Monthly Aggregation --> Notebook Cell Monthly delta_SUHI
+Reusable SUHI (Surface Urban Heat Island) Data Pipeline
+Using Google Earth Engine (GEE) + MODIS MYD11A1 (Aqua LST, 1km daily)
 
 Core Workflow:
-Each month → Apply ImageCollection.mean() to LST images for all days in that month → Obtain a monthly mean image
-→ Perform reduceToVectors on the monthly mean image (aggregate by grid cells) → Obtain monthly mean urban LST for each cell
-→ Simultaneously apply reduceRegion to rural regions → Obtain monthly mean rural LST
-→ delta_uhi = urban_cell_mean - rural_mean
+1. Define urban region (city geometry) and rural reference ring (buffer annulus)
+2. For each day in the date range, retrieve and QA-clean MODIS LST images
+   - Mask pixels with poor mandatory QA bits or zero LST values
+   - Convert raw DN → °C (scale × 0.02 − 273.15)
+3. Aggregate LST spatially:
+   - Option A (make_daily_table):       Whole-city daily mean/median urban LST vs. rural LST
+   - Option B (make_daily_table_cells): Per-grid-cell daily mean urban LST vs. rural LST
+     * Grid is built from projected pixel coordinates (cell_id = x * 1e8 + y)
+     * Rural reference is a single scalar per day (reduceRegion over rural ring)
+     * Urban cells use reduceRegions over the stable pixel grid
+4. Compute delta UHI per cell per day: uhi = LST_urb_cell − LST_rur
+5. Return a GEE FeatureCollection (exportable to CSV) with columns:
+   date | cell_id | LST_urb_cell | urb_cell_n | LST_rur | rural_cell_n | uhi
 """
 
 import ee
