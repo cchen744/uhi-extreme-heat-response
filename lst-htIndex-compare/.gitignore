@@ -1,23 +1,6 @@
-# Outputs
-outputs/
-*.csv
-*.png
-*.tif
-*.tiff
-*.nc
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb_checkpoints
-
-# Python
+client_secret_*.json
+credentials.json
+*.pyc
 __pycache__/
-*.py[cod]
-*.egg-info/
-.env
-
-# IDE
-.vscode/
-.idea/
-*.swp
-EOF
+.ipynb_checkpoints/
+outputs/
