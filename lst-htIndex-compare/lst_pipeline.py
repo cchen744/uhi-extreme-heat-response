@@ -3,6 +3,8 @@ LST Pipeline for geospatial analysis of Land Surface Temperature
 Fetches MODIS MOD11A1 data, performs seasonal aggregation, spatial analysis, and visualization
 """
 
+from logging import config
+
 import ee
 import geemap
 import pandas as pd
@@ -61,9 +63,12 @@ class LSTConfig:
         }
 
     def create_geom(self):
-        """Create GEE geometry from bounds"""
-        min_lon, min_lat, max_lon, max_lat = self.city_bounds
-        return ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat])
+        """Create GEE geometry from bounds or TIGER"""
+        if hasattr(self, '_tiger_geom'):
+            return self._tiger_geom
+        else:
+            min_lon, min_lat, max_lon, max_lat = self.city_bounds
+            return ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat])
 
 
 # ============================================================================
@@ -480,13 +485,34 @@ CITY_PRESETS = {
 }
 
 
-def create_config(city_name, start_year=2016, end_year=2026, output_dir='./outputs'):
-    """Create config from city preset"""
-    if city_name not in CITY_PRESETS:
-        raise ValueError(f"City {city_name} not in presets. Available: {list(CITY_PRESETS.keys())}")
-
-    bounds = CITY_PRESETS[city_name]['bounds']
-    return LSTConfig(city_name, bounds, start_year, end_year, output_dir)
+def create_config(city_name, fips_or_preset=None, start_year=2020, end_year=2024, output_dir='./outputs'):
+    """
+    Create config from city preset OR FIPS code
+    
+    Usage:
+        create_config('Miami')  # Uses preset bounds
+        create_config('Miami', '1204000', 2020, 2024)  # Uses FIPS code
+    """
+    config = LSTConfig(city_name, city_bounds=[0,0,0,0], start_year=start_year, end_year=end_year, output_dir=output_dir)
+    # If FIPS code provided, fetch geometry from TIGER
+    if fips_or_preset and isinstance(fips_or_preset, str) and len(fips_or_preset) == 7:
+        # FIPS code: fetch from TIGER
+        state_fips = fips_or_preset[:2]
+        place_fips = fips_or_preset[2:]
+        
+        tiger = ee.FeatureCollection('TIGER/2020/PLACES').filter(
+            ee.Filter.eq('STATEFP', state_fips)
+        ).filter(
+            ee.Filter.eq('PLACEFP', place_fips)
+        )
+        config._tiger_geom = tiger.geometry()
+    else:
+        # Use preset bounds
+        if city_name not in CITY_PRESETS:
+            raise ValueError(f"City {city_name} not in presets. Available: {list(CITY_PRESETS.keys())}")
+        config.city_bounds = CITY_PRESETS[city_name]['bounds']
+    
+    return config
 
 
 # ============================================================================
