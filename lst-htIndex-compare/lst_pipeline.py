@@ -96,7 +96,7 @@ class GEELSTFetcher:
             seasonal_data[year] = {}
 
             for season_name, months in config.seasons.items():
-                images = []
+                collections = []
 
                 for month in months:
                     # Handle year boundary for DJF (December of previous year)
@@ -114,14 +114,24 @@ class GEELSTFetcher:
                                   .filterBounds(geom)
                                   .select([config.lst_band, config.qa_band]))
 
+                    # debugging option
+                    size = collection.size().getInfo()
+                    print(f"  {year} {season_name} month {month}: {size} images")
+
                     # Apply QA filtering (keep only good quality pixels)
                     filtered = collection.map(lambda img: self._qa_filter(img, config))
-                    images.append(filtered)
+                    collections.append(filtered)
 
                 # Merge monthly images and compute median
-                merged = ee.ImageCollection(images).flatten()
-
-                if merged.size().getInfo() > 0:
+                if collections:
+                  merged = ee.ImageCollection([])
+                  for col in collections:
+                    merged = merged.merge(col)
+                
+                  merged_size = merged.size().getInfo()
+                  print(f"  {year} {season_name} merged: {merged_size} images")  # DEBUG
+                
+                  if merged_size > 0:
                     median_img = merged.select(config.lst_band).median()
                     seasonal_data[year][season_name] = median_img
 
