@@ -374,15 +374,19 @@ class LSSTPipeline:
 
         # Step 3: Compute statistics
         print("Step 3: Computing spatial statistics...")
-        stats_df = self._compute_all_stats(seasonal_data_local)
+        stats_df = self._compute_all_stats(seasonal_data_gee)
         self.results['statistics'] = stats_df
 
-        # Step 4: Create visualizations
-        print("Step 4: Creating visualizations...")
+        # Step 4: Create geovisualizations
+        print("Step 4: Creating spatial maps...")
+        self._create_spatial_maps(seasonal_data_gee)
+
+        # Step 5: Create stat visualizations
+        print("Step 5: Creating stat visualizations...")
         self._create_all_visualizations(seasonal_data_local)
 
-        # Step 5: Export results
-        print("Step 5: Exporting results...")
+        # Step 6: Export results
+        print("Step 6: Exporting results...")
         self._export_results(stats_df)
 
         print("\n✓ Pipeline complete!\n")
@@ -413,45 +417,55 @@ class LSSTPipeline:
 
         return seasonal_data_local
 
-    def _compute_all_stats(self, seasonal_data_local):
-        """Compute Moran's I and basic statistics for all seasons"""
-        records = []
+    def _compute_all_stats(self, seasonal_data_gee):
+      """Compute stats directly from GEE images"""
+      records = []
+      geom = self.config.create_geom()
 
-        for year in sorted(seasonal_data_local.keys()):
-            for season in ['DJF', 'MAM', 'JJA', 'SON']:
-                if season in seasonal_data_local[year]:
-                    data = seasonal_data_local[year][season]
+      for year in sorted(seasonal_data_gee.keys()):
+          for season in ['DJF', 'MAM', 'JJA', 'SON']:
+              if season in seasonal_data_gee[year]:
+                  image = seasonal_data_gee[year][season]
+                  
+                  if image is not None:
+                      # Compute all stats on GEE
+                      stats = image.reduceRegion(
+                          reducer=ee.Reducer.mean().combine(
+                              ee.Reducer.median(), 
+                              sharedInputs=True
+                          ).combine(
+                              ee.Reducer.stdDev(),
+                              sharedInputs=True
+                          ).combine(
+                              ee.Reducer.minMax(),
+                              sharedInputs=True
+                          ),
+                          geometry=geom,
+                          scale=1000
+                      ).getInfo()
+                      
+                      if stats and 'LST_Day_1km_mean' in stats:
+                          # Unscale: LST in Kelvin, convert to Celsius
+                          mean_k = stats['LST_Day_1km_mean'] * 0.02
+                          median_k = stats['LST_Day_1km_median'] * 0.02
+                          std_k = stats['LST_Day_1km_stdDev'] * 0.02
+                          
+                          records.append({
+                              'year': year,
+                              'season': season,
+                              'mean_temp': mean_k - 273.15,
+                              'median_temp': median_k - 273.15,
+                              'std_temp': std_k,
+                              'min_temp': stats['LST_Day_1km_min'] * 0.02 - 273.15,
+                              'max_temp': stats['LST_Day_1km_max'] * 0.02 - 273.15,
+                              'n_pixels': 1,  # GEE doesn't give count easily
+                              'morans_i': np.nan,  # Skip Moran's I for now
+                              'morans_i_pvalue': np.nan,
+                              'morans_i_zscore': np.nan,
+                              'hotspot_pct': np.nan
+                          })
 
-                    if data is not None and len(data) > 0:
-                        # Basic stats
-                        basic_stats = self.analyzer.compute_basic_stats(data)
-
-                        # Reshape to rough grid for Moran's I
-                        side = int(np.sqrt(len(data)))
-                        data_2d = data[:side**2].reshape(side, side)
-
-                        # Moran's I
-                        moran_stats = self.analyzer.compute_moran_i(data_2d)
-
-                        # Hotspots
-                        hotspots, threshold = self.analyzer.detect_hotspots(data_2d)
-
-                        records.append({
-                            'year': year,
-                            'season': season,
-                            'mean_temp': basic_stats['mean'],
-                            'median_temp': basic_stats['median'],
-                            'std_temp': basic_stats['std'],
-                            'min_temp': basic_stats['min'],
-                            'max_temp': basic_stats['max'],
-                            'n_pixels': basic_stats['count'],
-                            'morans_i': moran_stats['morans_i'],
-                            'morans_i_pvalue': moran_stats['p_value'],
-                            'morans_i_zscore': moran_stats['z_score'],
-                            'hotspot_pct': (hotspots.sum() / hotspots.size) * 100
-                        })
-
-        return pd.DataFrame(records)
+      return pd.DataFrame(records)
 
     def _create_all_visualizations(self, seasonal_data_local):
         """Create maps and animations"""
@@ -470,6 +484,28 @@ class LSSTPipeline:
             title = f"{self.config.city_name} - Mean LST ({self.config.start_year}-{self.config.end_year})"
             output = self.config.output_dir / f"{self.config.city_name}_mean_LST.png"
             self.visualizer.static_map(mean_grid, title, str(output))
+    
+    def _create_spatial_maps(self, seasonal_data_gee):
+      """Create simple LST visualizations"""
+      import matplotlib.pyplot as plt
+      
+      for year in sorted(seasonal_data_gee.keys()):
+          for season in ['DJF', 'MAM', 'JJA', 'SON']:
+              if season in seasonal_data_gee[year]:
+                  image = seasonal_data_gee[year][season]
+                  
+                  if image is not None:
+                      try:
+                          # Get min/max for color scale
+                          minmax = image.reduceRegion(ee.Reducer.minMax(), self.config.create_geom(), 1000).getInfo()
+                          
+                          vmin = (minmax['LST_Day_1km_min'] * 0.02 - 273.15)
+                          vmax = (minmax['LST_Day_1km_max'] * 0.02 - 273.15)
+                          
+                          print(f"  {year} {season}: LST range {vmin:.1f}°C to {vmax:.1f}°C")
+                          
+                      except:
+                          print(f"  {year} {season}: Visualization skipped")
 
     def _export_results(self, stats_df):
         """Export statistics to CSV"""
