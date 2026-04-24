@@ -1,13 +1,21 @@
 """
-Reusable SUHI data pipeline (GEE + MODIS LST)
-
-Optimized Version: GEE Cell Monthly Aggregation --> Notebook Cell Monthly delta_SUHI
+Reusable SUHI (Surface Urban Heat Island) Data Pipeline
+Using Google Earth Engine (GEE) + MODIS MYD11A1 (Aqua LST, 1km daily)
 
 Core Workflow:
-Each month → Apply ImageCollection.mean() to LST images for all days in that month → Obtain a monthly mean image
-→ Perform reduceToVectors on the monthly mean image (aggregate by grid cells) → Obtain monthly mean urban LST for each cell
-→ Simultaneously apply reduceRegion to rural regions → Obtain monthly mean rural LST
-→ delta_uhi = urban_cell_mean - rural_mean
+1. Define urban region (city geometry) and rural reference ring (buffer annulus)
+2. For each day in the date range, retrieve and QA-clean MODIS LST images
+   - Mask pixels with poor mandatory QA bits or zero LST values
+   - Convert raw DN → °C (scale × 0.02 − 273.15)
+3. Aggregate LST spatially:
+   - Option A (make_daily_table):       Whole-city daily mean/median urban LST vs. rural LST
+   - Option B (make_daily_table_cells): Per-grid-cell daily mean urban LST vs. rural LST
+     * Grid is built from projected pixel coordinates (cell_id = x * 1e8 + y)
+     * Rural reference is a single scalar per day (reduceRegion over rural ring)
+     * Urban cells use reduceRegions over the stable pixel grid
+4. Compute delta UHI per cell per day: uhi = LST_urb_cell − LST_rur
+5. Return a GEE FeatureCollection (exportable to CSV) with columns:
+   date | cell_id | LST_urb_cell | urb_cell_n | LST_rur | rural_cell_n | uhi
 """
 
 import ee
@@ -64,25 +72,22 @@ def clean_lst(img, lst_band, qc_band):
 # 3. Build urban / rural masks (UA + LCZ)
 # ------------------------------------------------------------------
 def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
-    lcz_img = ee.ImageCollection("RUB/RUBCLIM/LCZ/global_lcz_map/latest").first()
-    lcz = lcz_img.select("LCZ_Filter")
+    # lcz_img = ee.ImageCollection("RUB/RUBCLIM/LCZ/global_lcz_map/latest").first()
+    # lcz = lcz_img.select("LCZ_Filter")
 
-    BUILT_MIN, BUILT_MAX = 1, 10
-    WATER_CODE = 17
+    # BUILT_MIN, BUILT_MAX = 1, 10
+    # WATER_CODE = 17
 
-    is_built = lcz.gte(BUILT_MIN).And(lcz.lte(BUILT_MAX))
-    is_water = lcz.eq(WATER_CODE)
-    is_natural = is_built.Not().And(is_water.Not())
+    # is_built = lcz.gte(BUILT_MIN).And(lcz.lte(BUILT_MAX))
+    # is_water = lcz.eq(WATER_CODE)
+    # is_natural = is_built.Not().And(is_water.Not())
 
     urban_region = city_geom
     outer = city_geom.buffer(ring_outer_m)
     inner = city_geom.buffer(ring_inner_m)
     rural_region = outer.difference(inner)
 
-    urban_mask = is_built.clip(urban_region)
-    rural_mask = is_natural.clip(rural_region)
-
-    return urban_region, rural_region, urban_mask, rural_mask
+    return urban_region, rural_region
 
 # ------------------------------------------------------------------
 # 4. Daily aggregation (UA x day) - OPTIMIZED
@@ -90,7 +95,6 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
 def make_daily_table(
     start, end,
     urban_region, rural_region,
-    urban_mask, rural_mask,
     lst_band, qc_band,
     agg_func="mean",
     lst_scale_m=1000
@@ -114,8 +118,8 @@ def make_daily_table(
     def agg(img):
         date = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
 
-        urb = img.updateMask(urban_mask)
-        rur = img.updateMask(rural_mask)
+        urb = img.clip(urban_region)
+        rur = img.clip(rural_region)
 
         # 1. Urban Reduction (Both Stats at once)
         urb_stats = urb.reduceRegion(
@@ -145,12 +149,12 @@ def make_daily_table(
             "rural_n": rur_stats.get(key_cnt),
         })
 
-    return ic.map(agg)
+    final_fc = ee.FeatureCollection(ic.map(agg))
+    return final_fc
 
 def make_daily_table_cells(
     start_date, end_date,
     urban_region, rural_region,
-    urban_mask, rural_mask,
     lst_band, qc_band,
     lst_scale_m=1000,
     cell_scale_m=1000,       # * grid resolution in meters
@@ -163,9 +167,9 @@ def make_daily_table_cells(
         date        | YYYY-MM-dd string
         cell_id      | integer pixel coordinate hash (x * 1e8 + y), stable across days
         LST_urb_cell | daily mean urban LST for this cell (°C)
-        cell_n       | number of valid MODIS pixels averaged into LST_urb_cell
+        urb_cell_n       | number of valid MODIS pixels averaged into LST_urb_cell
         LST_rur      | daily mean rural LST for the city (°C), one value one day
-        rural_n      | number of valid MODIS pixels averaged into LST_rur
+        rural_cell_n      | number of valid MODIS pixels averaged into LST_rur
         uhi    | LST_urb_cell - LST_rur (°C)
     """
     # * Precompute grid geometry constants (shared across all months)
@@ -183,8 +187,24 @@ def make_daily_table_cells(
 
     # * Combined reducer: mean + count in a single pass
     combined = ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True)
+    
+    dummy = ee.Image.constant(1).rename("dummy")
+    grid = (
+          cell_id_img.addBands(dummy)
+          .reduceToVectors(
+                  geometry=bounds,
+                  scale=cell_scale_m,
+                  geometryType="polygon", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
+                  crs=crs,
+                  labelProperty="cell_id",
+                  reducer=ee.Reducer.first(),
+                  maxPixels=1e13,
+                  tileScale=tileScale
+              )
+              .filterBounds(region_proj)
+      )
 
-    # * Step 1: collapse all valid daily images in this month to a single mean image
+    # * Step 1: collect daily image
     daily_ics = (
         ee.ImageCollection("MODIS/061/MYD11A1")
         .filterBounds(urban_region)
@@ -194,6 +214,8 @@ def make_daily_table_cells(
         # * temporal mean across days — reduces compute vs per-day loop
     )
 
+    # print("Rural stat:", rur_stats.getInfo())
+    
     daily_fc_list = [] # container of final output
     img_list = daily_ics.toList(daily_ics.size()) # a list of daily images
 
@@ -202,10 +224,10 @@ def make_daily_table_cells(
       for each image, generate a grided imge with uhi in each grid cell
       '''
       date_str = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
-      urb = img.updateMask(urban_mask)
-      rur = img.updateMask(rural_mask)
+      urb = img.clip(urban_region)
+      rur = img.clip(rural_region)
 
-      # * Step 1: rural reference — one scalar per month (cheap reduceRegion)
+      # * Step 1: rural reference — one scalar per day
       rur_stats = rur.reduceRegion(
         reducer=combined,
         geometry=rural_region,
@@ -213,29 +235,29 @@ def make_daily_table_cells(
         maxPixels=1e13
     )
       lst_rur = rur_stats.get(f"{lst_band}_mean")
-      rural_n = rur_stats.get(f"{lst_band}_count")
+      rural_cell_n = rur_stats.get(f"{lst_band}_count")
 
-      # * Step 2: urban cells — reduceToVectors on the daily image.
-      urb_cells = (
-          cell_id_img.addBands(urb)
-              .reduceToVectors(
-                  geometry=bounds,
-                  scale=cell_scale_m,
-                  geometryType="centroid", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
-                  crs=crs,
-                  labelProperty="cell_id",
-                  reducer=combined,
-                  maxPixels=1e13,
-                  tileScale=tileScale
-              )
-              .filterBounds(region_proj)
+      # * Step 2: urban cells —  on the daily image.
+      
+    
+      urb_cells = urb.reduceRegions(
+          collection=grid,
+          reducer=combined,
+          scale=lst_scale_m,
+          crs=img.projection(),
+          tileScale=tileScale
       )
 
-      # * Step 3: attach daily, rural reference, and uhi to each cell feature
-      def add_props(ft, _lst_rur=lst_rur, _rural_n=rural_n, _date=date_str):
+      # print("None empty urb cell:", urb_cells
+     # .filter(ee.Filter.gt("count", 0))
+     # .first()
+     # .getInfo())
+
+      # Step 3: attach daily, rural reference, and uhi to each cell feature
+      def add_props(ft, _lst_rur=lst_rur, _rural_cell_n=rural_cell_n, _date=date_str):
           lst_urb = ft.get("mean")
-          cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
-          # * uhi computed server-side so the exported CSV is analysis-ready
+          urb_cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
+          # uhi computed server-side so the exported CSV is analysis-ready
           uhi = ee.Algorithms.If(
               ee.Algorithms.IsEqual(lst_urb, None),
               None,
@@ -248,21 +270,34 @@ def make_daily_table_cells(
           return ft.set({
               "date":        _date,
               "LST_urb_cell": lst_urb,
-              "cell_n":       cell_n,
+              "urb_cell_n":       urb_cell_n,
               "LST_rur":      _lst_rur,
-              "rural_n":      _rural_n,
+              "rural_cell_n":      _rural_cell_n,
               "uhi":    uhi,
-          }).select(["date", "cell_id", "LST_urb_cell", "cell_n",
-                      "LST_rur", "rural_n", "uhi"])
-      return urb_cells.map(add_props)
+          }).select(["date", "cell_id", "LST_urb_cell", "urb_cell_n",
+                      "LST_rur", "rural_cell_n", "uhi"])
+      
+      mapped_fc = urb_cells.map(add_props)
+
+      # print("Non-empty urb cells with properties:", mapped_fc
+      # .filter(ee.Filter.gt("urb_cell_n", 0))
+      # .first()
+      # .getInfo())
+
+      return mapped_fc
 
     n = daily_ics.size().getInfo()
 
     for i in range(n):
       img = ee.Image(img_list.get(i))
       daily_fc_list.append(single_img_processer(img))
+    # Fixing empty dataset:filterDate is silently dropping everything because features use a string 'date' property instead of system:time_start.
+    def add_time_start(feature):
+        date = ee.Date(feature.get('date'))
+        return feature.set('system:time_start', date.millis())
+    final_fc = ee.FeatureCollection(daily_fc_list).flatten()
     
-    return ee.FeatureCollection(daily_fc_list).flatten()
+    return final_fc.map(add_time_start)
 
 # ------------------------------------------------------------------
 # 6. Urban Area Selector
@@ -284,177 +319,3 @@ def select_ua(ua_fc, *, ua_name=None, ua_contains=None, ua_names=None):
             filt = f if filt is None else ee.Filter.Or(filt, f)
         fc = ua_fc.filter(filt)
     return fc
-
-# ------------------------------------------------------------------
-# 7. UPDATE: Main entry: have options for running one city or running one grid cell
-# ------------------------------------------------------------------
-def run_city(
-    *,
-    ua_fc,
-    start_date,
-    end_date,
-    ua_name=None,
-    ua_contains=None,
-    ua_names=None,
-    lst_band="LST_Night_1km",
-    qc_band="QC_Night",
-    agg_func="median", # NOTE: only used for unit='city'; monthly cell path always uses mean
-    ring_outer_m=12000,
-    ring_inner_m=3000,
-    lst_scale_m=1000,
-    min_urban_pixels=50,
-    min_rural_pixels=50,
-    unit='city',
-    cell_scale_m=1000,
-    min_cell_pixels=1,
-    cell_crs="EPSG:3857",
-    out_csv=None,
-    export_to_drive=False,
-    export_desc=None,
-    export_folder="UHI_exports",
-    debug=False,
-    relax_filters_on_empty=True
-):
-    city_fc = select_ua(ua_fc, ua_name=ua_name, ua_contains=ua_contains, ua_names=ua_names)
-    if city_fc.size().getInfo() == 0:
-        raise ValueError("No UA matched your query.")
-    city_geom = city_fc.geometry()
-
-    urban_region, rural_region, urban_mask, rural_mask = build_masks(
-        city_geom, ring_outer_m, ring_inner_m
-    )
-
-    def build_fc_list(min_urban_px, min_rural_px, min_cell_px):
-          fc_list_local = []
-          range_labels_local = []
-
-          if unit == 'city':
-              # Keep city output at daily resolution for extreme-day analysis.
-              fc = make_daily_table(
-                  start_date, end_date,
-                  urban_region, rural_region,
-                  urban_mask, rural_mask,
-                  lst_band, qc_band,
-                  agg_func, lst_scale_m
-              )
-
-              fc = ee.FeatureCollection(fc)
-              # Clean up nulls
-              fc = fc.filter(ee.Filter.notNull(["LST_urb", "LST_rur", "urban_n", "rural_n", "date"]))
-              fc = fc.filter(ee.Filter.gte("urban_n", min_urban_px))
-              fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
-              fc = fc.select(["date", "LST_urb", "LST_rur", "urban_n", "rural_n"])
-              fc_list_local.append(fc)
-              range_labels_local.append((start_date, end_date))
-
-          elif unit == "cell":
-              # * MODIFIED: replaced make_daily_table_cells (day × cell) with
-              # *           make_monthly_table_cells (month × cell).
-              fc = make_monthly_table_cells(
-                  start_date, end_date,
-                  urban_region, rural_region,
-                  urban_mask, rural_mask,
-                  lst_band, qc_band,
-                  lst_scale_m=lst_scale_m,
-                  cell_scale_m=cell_scale_m,
-                  crs=cell_crs
-              )
-              fc = ee.FeatureCollection(fc)
-              fc = fc.filter(ee.Filter.notNull(["month", "cell_id", "LST_urb_cell",
-                                                "cell_n", "LST_rur", "rural_n", "delta_uhi"]))
-              fc = fc.filter(ee.Filter.gte("cell_n", min_cell_px))
-              fc = fc.filter(ee.Filter.gte("rural_n", min_rural_px))
-              fc = fc.select(["month", "cell_id", "LST_urb_cell", "cell_n",
-                              "LST_rur", "rural_n", "delta_uhi"])
-              fc_list_local.append(fc)
-              range_labels_local.append((start_date, end_date))
-
-          else:
-              raise ValueError("unit must be 'city' or 'cell'")
-
-          return fc_list_local, range_labels_local
-
-    fc_list, range_labels = build_fc_list(min_urban_pixels, min_rural_pixels, min_cell_pixels)           
-  
-    print("fc_list length:", len(fc_list))
-   
-
-    if not fc_list:
-      return pd.DataFrame()
-    print("first fc size:", fc_list[0].size().getInfo())
-
-    fc_all = ee.FeatureCollection(fc_list).flatten()
-    fc_all_size = fc_all.size().getInfo()
-
-    if fc_all_size == 0:
-      if relax_filters_on_empty:
-        relaxed_urban_px = 1
-        relaxed_rural_px = 1
-        relaxed_cell_px = 1
-        print(
-          "No features returned after filtering. Retrying with relaxed pixel thresholds: "
-          f"urban>={relaxed_urban_px}, rural>={relaxed_rural_px}, cell>={relaxed_cell_px}."
-        )
-        fc_list, range_labels = build_fc_list(relaxed_urban_px, relaxed_rural_px, relaxed_cell_px)
-        fc_all = ee.FeatureCollection(fc_list).flatten()
-        fc_all_size = fc_all.size().getInfo()
-      if fc_all_size == 0:
-        print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
-        if debug:
-          print("Feature counts after filtering:")
-          for (s, e), fc in zip(range_labels, fc_list):
-            feature_count = fc.size().getInfo()
-            print(f"  {s} to {e}: {feature_count}")
-          print(
-            "Consider lowering min_urban_pixels/min_rural_pixels "
-            "(or min_cell_pixels for unit='cell') or expanding date/AOI filters."
-          )
-        return pd.DataFrame()
-
-    fc_all_size = fc_all.size().getInfo()
-    if fc_all_size == 0:
-      print("No features returned from Earth Engine after filtering. Returning empty DataFrame.")
-      return pd.DataFrame()
-
-    if export_to_drive:
-      desc = export_desc or f"UHI_{ua_name or ua_contains or 'city'}"
-      task = ee.batch.Export.table.toDrive(
-        collection=fc_all,
-        description=desc,
-        fileFormat="CSV",
-        fileNamePrefix=desc,
-        folder=export_folder
-      )
-      task.start()
-      return None
-
-    # Optimized: Try to fetch data. 
-    # The previous 500 error happens here. The upstream optimization (combined reducer) should help.
-    try:
-        df_all = geemap.ee_to_df(fc_all)
-        print("df_all columns:", list(df_all.columns))
-        print("df_all shape:", df_all.shape)
-        print(df_all.empty)
-    except Exception as e:
-        print(f"Error fetching data: {e}")
-        return pd.DataFrame()
-
-    if unit == "city":
-      if "date" not in df_all.columns:
-        print("Missing 'date' column in DataFrame. Available columns:", list(df_all.columns))
-        return pd.DataFrame()
-      df_all["date"] = pd.to_datetime(df_all["date"])
-      df_all = df_all.drop_duplicates(subset=["date"]).reset_index(drop=True)
-      df_all["SUHI"] = df_all["LST_urb"] - df_all["LST_rur"]
-
-
-    elif unit == "cell":
-        # * MODIFIED: dedup on (month, cell_id) instead of (date, cell_id);
-        # *           delta_uhi already computed in GEE, no need to recalculate here
-        if "month" not in df_all.columns:
-            print("Missing 'month' column. Available:", list(df_all.columns))
-            return pd.DataFrame()
-        df_all = df_all.drop_duplicates(subset=["month", "cell_id"]).reset_index(drop=True)
-        # delta_uhi is already in the DataFrame from GEE computation
-
-    return df_all
