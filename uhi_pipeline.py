@@ -1,23 +1,24 @@
 """
 Reusable SUHI (Surface Urban Heat Island) Data Pipeline
-Using Google Earth Engine (GEE) + MODIS MYD11A1 (Aqua LST, 1km daily)
+Using Google Earth Engine (GEE) + PRISM (air temp) + Landsat 8/9 (LST)
 
 Core Workflow:
 1. Define urban region (city geometry) and rural reference ring (buffer annulus)
-2. For each day in the date range, retrieve and QA-clean MODIS LST images
-   - Mask pixels with poor mandatory QA bits or zero LST values
-   - Convert raw DN → °C (scale × 0.02 − 273.15)
-3. Aggregate LST spatially:
-   - Option A (make_daily_table):       Whole-city daily mean/median urban LST vs. rural LST
-   - Option B (make_daily_table_cells): Per-grid-cell daily mean urban LST vs. rural LST
-     * Grid is built from projected pixel coordinates (cell_id = x * 1e8 + y)
-     * Rural reference is a single scalar per day (reduceRegion over rural ring)
-     * Urban cells use reduceRegions over the stable pixel grid
-4. Compute delta UHI per cell per day: uhi = LST_urb_cell − LST_rur
-5. Return a GEE FeatureCollection (exportable to CSV) with columns:
-   date | cell_id | LST_urb_cell | urb_cell_n | LST_rur | rural_cell_n | uhi
+2. Label extreme-heat days using PRISM daily max air temperature — the
+   90th percentile of summer (JJA) tmax, computed independently of any
+   satellite LST product to avoid circularity.
+3. For each Landsat 8/9 scene whose acquisition date falls in the extreme
+   or baseline date list:
+   - Mask cloud/shadow/cirrus pixels via QA_PIXEL
+   - Convert ST_B10 to °C
+   - Subtract that scene's own rural-ring mean temperature to get a
+     per-scene UHI field (this makes scenes from different heat events
+     comparable — otherwise averaging raw LST would reflect event
+     intensity, not spatial pattern)
+4. Average all per-scene UHI fields within each group (extreme vs. baseline)
+   to get a 30m composite UHI map for each condition.
+5. delta_UHI = mean(UHI | extreme) − mean(UHI | baseline)
 """
-
 import ee
 import geemap
 import pandas as pd
@@ -36,39 +37,6 @@ def init_ee():
         ee.Initialize()
 
 # ------------------------------------------------------------------
-# 1. Helper: monthly ranges
-# ------------------------------------------------------------------
-def month_starts(start_date, end_date):
-    s = datetime.strptime(start_date, "%Y-%m-%d").replace(day=1)
-    e = datetime.strptime(end_date, "%Y-%m-%d")
-    cur = s
-    while cur < e:
-        nxt = cur + relativedelta(months=1)
-        yield cur.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
-        cur = nxt
-
-# ------------------------------------------------------------------
-# 2. MODIS LST cleaning (QA)
-# ------------------------------------------------------------------
-def clean_lst(img, lst_band, qc_band):
-    lst = img.select(lst_band)
-    qc = img.select(qc_band).toUint16()
-    
-    # bits 0-1: mandatory QA
-    mandatory = qc.bitwiseAnd(3)
-    produced = mandatory.lte(1)
-    valid = lst.neq(0)
-    good = produced.And(valid)
-    
-    lst_c = lst.multiply(0.02).subtract(273.15)
-    
-    return (
-        lst_c.updateMask(good)
-             .rename(lst_band)
-             .copyProperties(img, ["system:time_start"])
-    )
-
-# ------------------------------------------------------------------
 # 3. Build urban / rural masks (UA + LCZ)
 # ------------------------------------------------------------------
 def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
@@ -79,216 +47,6 @@ def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
     rural_region = outer.difference(inner)
 
     return urban_region, rural_region
-
-# ------------------------------------------------------------------
-# 4. Daily aggregation (UA x day) - OPTIMIZED
-# ------------------------------------------------------------------
-def make_daily_table(
-    start, end,
-    urban_region, rural_region,
-    lst_band, qc_band,
-    agg_func="mean",
-    lst_scale_m=1000
-):
-    ic = (
-        ee.ImageCollection("MODIS/061/MYD11A1")
-        .filterBounds(urban_region)
-        .filterDate(start, end)
-        .select([lst_band, qc_band])
-        .map(lambda img: clean_lst(img, lst_band, qc_band))
-    )
-
-    # OPTIMIZATION#1: Combine Mean/Median with Count into a single Reducer
-    # This reduces the number of reduceRegion calls by half.
-    base_reducer = ee.Reducer.mean() if agg_func == "mean" else ee.Reducer.median()
-    combined_reducer = base_reducer.combine(
-        reducer2=ee.Reducer.count(),
-        sharedInputs=True
-    )
-
-    def agg(img):
-        date = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
-
-        urb = img.clip(urban_region)
-        rur = img.clip(rural_region)
-
-        # 1. Urban Reduction (Both Stats at once)
-        urb_stats = urb.reduceRegion(
-            reducer=combined_reducer,
-            geometry=urban_region,
-            scale=lst_scale_m,
-            maxPixels=1e13
-        )
-
-        # 2. Rural Reduction (Both Stats at once)
-        rur_stats = rur.reduceRegion(
-            reducer=combined_reducer,
-            geometry=rural_region,
-            scale=lst_scale_m,
-            maxPixels=1e13
-        )
-        
-        # Construct Output Keys based on default reducer outputs
-        key_val = f"{lst_band}_mean" if agg_func == "mean" else f"{lst_band}_median"
-        key_cnt = f"{lst_band}_count"
-
-        return ee.Feature(None, {
-            "date": date,
-            "LST_urb": urb_stats.get(key_val),
-            "LST_rur": rur_stats.get(key_val),
-            "urban_n": urb_stats.get(key_cnt),
-            "rural_n": rur_stats.get(key_cnt),
-        })
-
-    final_fc = ee.FeatureCollection(ic.map(agg))
-    return final_fc
-
-def make_daily_table_cells(
-    start_date, end_date,
-    urban_region, rural_region,
-    lst_band, qc_band,
-    lst_scale_m=1000,
-    cell_scale_m=1000,       # * grid resolution in meters
-    crs="EPSG:3857",
-    err_m=100,
-    tileScale=4
-):
-    """
-    Returns a FeatureCollection with one image per (date, cell):
-        date        | YYYY-MM-dd string
-        cell_id      | integer pixel coordinate hash (x * 1e8 + y), stable across days
-        LST_urb_cell | daily mean urban LST for this cell (°C)
-        urb_cell_n       | number of valid MODIS pixels averaged into LST_urb_cell
-        LST_rur      | daily mean rural LST for the city (°C), one value one day
-        rural_cell_n      | number of valid MODIS pixels averaged into LST_rur
-        uhi    | LST_urb_cell - LST_rur (°C)
-    """
-    # * Precompute grid geometry constants (shared across all months)
-    proj       = ee.Projection(crs).atScale(cell_scale_m)
-    pc         = ee.Image.pixelCoordinates(proj)
-    # * cell_id image: integer hash of pixel (x, y) coordinates — unique and stable
-    cell_id_img = (
-        pc.select("x").toInt()
-          .multiply(100000000)
-          .add(pc.select("y").toInt())
-          .rename("cell_id")
-    )
-    bounds      = urban_region.bounds(ee.ErrorMargin(err_m)).transform(crs, 1)
-    region_proj = urban_region.transform(crs, 1).simplify(cell_scale_m / 2)
-
-    # * Combined reducer: mean + count in a single pass
-    combined = ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True)
-    
-    dummy = ee.Image.constant(1).rename("dummy")
-    grid = (
-          cell_id_img.addBands(dummy)
-          .reduceToVectors(
-                  geometry=bounds,
-                  scale=cell_scale_m,
-                  geometryType="polygon", # Determining whether a point lies inside a polygon is more efficient than determining whether it intersects the polygon.
-                  crs=crs,
-                  labelProperty="cell_id",
-                  reducer=ee.Reducer.first(),
-                  maxPixels=1e13,
-                  tileScale=tileScale
-              )
-              .filterBounds(region_proj)
-      )
-
-    # * Step 1: collect daily image
-    daily_ics = (
-        ee.ImageCollection("MODIS/061/MYD11A1")
-        .filterBounds(urban_region)
-        .filterDate(start_date, end_date)
-        .select([lst_band, qc_band])
-        .map(lambda img: clean_lst(img, lst_band, qc_band))
-        # * temporal mean across days — reduces compute vs per-day loop
-    )
-
-    # print("Rural stat:", rur_stats.getInfo())
-    
-    daily_fc_list = [] # container of final output
-    img_list = daily_ics.toList(daily_ics.size()) # a list of daily images
-
-    def single_img_processer(img):
-      '''
-      for each image, generate a grided imge with uhi in each grid cell
-      '''
-      date_str = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd")
-      urb = img.clip(urban_region)
-      rur = img.clip(rural_region)
-
-      # * Step 1: rural reference — one scalar per day
-      rur_stats = rur.reduceRegion(
-        reducer=combined,
-        geometry=rural_region,
-        scale=lst_scale_m,
-        maxPixels=1e13
-    )
-      lst_rur = rur_stats.get(f"{lst_band}_mean")
-      rural_cell_n = rur_stats.get(f"{lst_band}_count")
-
-      # * Step 2: urban cells —  on the daily image.
-      
-    
-      urb_cells = urb.reduceRegions(
-          collection=grid,
-          reducer=combined,
-          scale=lst_scale_m,
-          crs=img.projection(),
-          tileScale=tileScale
-      )
-
-      # print("None empty urb cell:", urb_cells
-     # .filter(ee.Filter.gt("count", 0))
-     # .first()
-     # .getInfo())
-
-      # Step 3: attach daily, rural reference, and uhi to each cell feature
-      def add_props(ft, _lst_rur=lst_rur, _rural_cell_n=rural_cell_n, _date=date_str):
-          lst_urb = ft.get("mean")
-          urb_cell_n = ft.get("count") # cell_n = The number of valid MODIS pixels used to compute the temperature for this cell
-          # uhi computed server-side so the exported CSV is analysis-ready
-          uhi = ee.Algorithms.If(
-              ee.Algorithms.IsEqual(lst_urb, None),
-              None,
-              ee.Algorithms.If(
-                  ee.Algorithms.IsEqual(_lst_rur, None),
-                  None,
-                  ee.Number(lst_urb).subtract(ee.Number(_lst_rur))
-              )
-          )
-          return ft.set({
-              "date":        _date,
-              "LST_urb_cell": lst_urb,
-              "urb_cell_n":       urb_cell_n,
-              "LST_rur":      _lst_rur,
-              "rural_cell_n":      _rural_cell_n,
-              "uhi":    uhi,
-          }).select(["date", "cell_id", "LST_urb_cell", "urb_cell_n",
-                      "LST_rur", "rural_cell_n", "uhi"])
-      
-      mapped_fc = urb_cells.map(add_props)
-
-      # print("Non-empty urb cells with properties:", mapped_fc
-      # .filter(ee.Filter.gt("urb_cell_n", 0))
-      # .first()
-      # .getInfo())
-
-      return mapped_fc
-
-    n = daily_ics.size().getInfo()
-
-    for i in range(n):
-      img = ee.Image(img_list.get(i))
-      daily_fc_list.append(single_img_processer(img))
-    # Fixing empty dataset:filterDate is silently dropping everything because features use a string 'date' property instead of system:time_start.
-    def add_time_start(feature):
-        date = ee.Date(feature.get('date'))
-        return feature.set('system:time_start', date.millis())
-    final_fc = ee.FeatureCollection(daily_fc_list).flatten()
-    
-    return final_fc.map(add_time_start)
 
 # ------------------------------------------------------------------
 # 6. Urban Area Selector
@@ -303,39 +61,138 @@ def select_ua(ua_fc, ua_contains=None, ua_name=None, ua_names=None):
         return ua_fc.filter(ee.Filter.stringContains('NAME20', ua_contains))
 
 # ------------------------------------------------------------------
-# 7. Extreme heat day labeling (PRISM tmax, independent of MODIS LST)
+# 7a. Extreme-day labels from PRISM only (no MODIS needed)
 # ------------------------------------------------------------------
-def label_extreme_days(df_all, city_geom, start_date, end_date, extreme_percentile=90):
-    df_all = df_all.copy()
-    df_all["date"] = pd.to_datetime(df_all["date"])
-
+def get_extreme_day_labels(
+    city_geom,
+    start_date,
+    end_date,
+    extreme_percentile=90,
+    summer_months=(6, 7, 8),
+):
+    """
+    Returns a DataFrame: date | tmax | is_extreme, for every PRISM day in range.
+ 
+    The threshold is the given percentile of tmax across summer days only,
+    so 'extreme' means 'hot relative to this city's own summer', not
+    relative to the whole year.
+ 
+    PRISM is 2m air temperature interpolated from weather stations —
+    completely independent of any satellite LST product, so the label
+    is exogenous to the UHI signal being measured.
+    """
     prism = ee.ImageCollection("OREGONSTATE/PRISM/ANd").select("tmax")
-
+ 
     def daily_mean(img):
         val = img.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=city_geom,
-            scale=4000,
-            maxPixels=1e9
+            scale=4000, # PRISM's initial resolution is 4km. Do 4000m to match that.
+            maxPixels=1e9,
         ).get("tmax")
-        return ee.Feature(None, {"date": img.date().format("YYYY-MM-dd"), "tmax": val})
-
+        return ee.Feature(None, {
+            "date": img.date().format("YYYY-MM-dd"),
+            "tmax": val,
+        })
+ 
     fc = ee.FeatureCollection(
-        prism.filterBounds(city_geom).filterDate(start_date, end_date).map(daily_mean)
+        prism.filterBounds(city_geom)
+             .filterDate(start_date, end_date)
+             .map(daily_mean)
     )
+ 
+    df = geemap.ee_to_df(fc)
+    df["date"] = pd.to_datetime(df["date"])
+    df["tmax"] = pd.to_numeric(df["tmax"], errors="coerce") # If getting error, use 'NaN' as default filler
+    df = df.dropna(subset=["tmax"]).sort_values("date")
+ 
+    summer = df[df["date"].dt.month.isin(summer_months)]
+    threshold = summer["tmax"].quantile(extreme_percentile / 100.0)
+    df["is_extreme"] = ((df["tmax"] >= threshold) &
+                        (df["date"].dt.month.isin(summer_months))).astype(int)
+ 
+    n_extreme = int(df["is_extreme"].sum())
+    n_summer = len(summer)
+    print(f"PRISM p{extreme_percentile} threshold = {threshold:.2f} degC "
+          f"(summer-only) | extreme days = {n_extreme} of {n_summer} summer days")
+ 
+    return df, threshold
 
-    prism_df = geemap.ee_to_df(fc)
-    prism_df["date"] = pd.to_datetime(prism_df["date"])
-    prism_df = prism_df.dropna(subset=["tmax"])
+def split_extreme_baseline_dates(prism_df, summer_months=(6, 7, 8)):
+    """
+    Splits the PRISM label table into two explicit date lists for
+    Landsat scene selection. Baseline = summer days that are NOT extreme.
+    """
+    summer = prism_df[prism_df["date"].dt.month.isin(summer_months)]
+ 
+    extreme_dates = (summer.loc[summer["is_extreme"] == 1, "date"]
+                           .dt.strftime("%Y-%m-%d").tolist())
+    baseline_dates = (summer.loc[summer["is_extreme"] == 0, "date"]
+                            .dt.strftime("%Y-%m-%d").tolist())
+ 
+    print(f"extreme dates: {len(extreme_dates)} | baseline dates: {len(baseline_dates)}")
+    return extreme_dates, baseline_dates
 
-    prism_summer = prism_df[prism_df["date"].dt.month.isin([6, 7, 8])]
-    threshold = prism_summer["tmax"].quantile(extreme_percentile / 100.0)
-    prism_df["is_extreme"] = (prism_df["tmax"] >= threshold).astype(int)
-
-    df_all = df_all.merge(prism_df[["date", "is_extreme"]], on="date", how="left")
-    df_all["is_extreme"] = df_all["is_extreme"].fillna(0).astype(int)
-
-    print(f"extreme days = {df_all['is_extreme'].sum()}, "
-          f"PRISM tmax p{extreme_percentile} threshold = {threshold:.2f}°C (summer-only)")
-
-    return df_all, threshold   
+# ------------------------------------------------------------------
+# 7b. Landsat UHI composite — per-scene normalization, then group mean
+# ------------------------------------------------------------------
+def landsat_uhi_composite(
+    city_geom,
+    rural_region,
+    dates,
+    cloud_max=40, # get the image if cloud coverage is smaller than 40%
+    rural_scale_m=300,
+):
+    """
+    Builds a mean UHI field (30m) from all Landsat 8/9 scenes whose
+    acquisition date is in `dates`.
+ 
+    Each scene is normalized against ITS OWN rural reference temperature
+    before averaging. This matters: raw LST differs by several degrees
+    between one heat event and another, so averaging raw LST across
+    events would measure event intensity rather than spatial pattern.
+    Subtracting each scene's own rural mean first makes scenes comparable.
+ 
+    Returns (mean_uhi_image, scene_count).
+    """
+    landsat = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+               .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))) # Use two satellites ensure we are getting complete data
+ 
+    def to_lst(img):
+        qa = img.select("QA_PIXEL")
+        clear = (qa.bitwiseAnd(1 << 3).eq(0)
+                 .And(qa.bitwiseAnd(1 << 4).eq(0))
+                 .And(qa.bitwiseAnd(1 << 2).eq(0)))
+        lst = (img.select("ST_B10")
+                  .multiply(0.00341802).add(149.0).subtract(273.15)
+                  .rename("LST_C")
+                  .updateMask(clear)) # convert raw digital number to Celsius
+        return lst.copyProperties(img, ["system:time_start"])
+ 
+    ic = (landsat
+          .filterBounds(city_geom)
+          .filter(ee.Filter.lt("CLOUD_COVER", cloud_max))
+          .map(lambda i: i.set("date_str", i.date().format("YYYY-MM-dd")))
+          .filter(ee.Filter.inList("date_str", ee.List(dates)))
+          .map(to_lst))
+ 
+    def tag_rural_ref(img):
+        # coarser scale here is fine — this is a single scalar per scene,
+        # and running it at 30m is needlessly slow
+        ref = img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=rural_region,
+            scale=rural_scale_m,
+            maxPixels=1e9, # Safety limit for reduceRegion() to make sure GEE doesn't crash
+        ).get("LST_C")
+        return img.set("rur_ref", ref)
+ 
+    ic = ic.map(tag_rural_ref).filter(ee.Filter.notNull(["rur_ref"]))
+ 
+    def to_uhi(img):
+        return (img.subtract(ee.Number(img.get("rur_ref")))
+                   .rename("UHI")
+                   .copyProperties(img, ["system:time_start"]))
+ 
+    uhi_ic = ic.map(to_uhi)
+    return uhi_ic.mean(), ic.size()
