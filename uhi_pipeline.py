@@ -72,15 +72,6 @@ def clean_lst(img, lst_band, qc_band):
 # 3. Build urban / rural masks (UA + LCZ)
 # ------------------------------------------------------------------
 def build_masks(city_geom, ring_outer_m, ring_inner_m, lcz_scale_m=100):
-    # lcz_img = ee.ImageCollection("RUB/RUBCLIM/LCZ/global_lcz_map/latest").first()
-    # lcz = lcz_img.select("LCZ_Filter")
-
-    # BUILT_MIN, BUILT_MAX = 1, 10
-    # WATER_CODE = 17
-
-    # is_built = lcz.gte(BUILT_MIN).And(lcz.lte(BUILT_MAX))
-    # is_water = lcz.eq(WATER_CODE)
-    # is_natural = is_built.Not().And(is_water.Not())
 
     urban_region = city_geom
     outer = city_geom.buffer(ring_outer_m)
@@ -303,19 +294,35 @@ def make_daily_table_cells(
 # 6. Urban Area Selector
 # ------------------------------------------------------------------
 
-def select_ua(ua_fc, *, ua_name=None, ua_contains=None, ua_names=None):
-    args = [ua_name is not None, ua_contains is not None, ua_names is not None]
-    if sum(args) != 1:
-        raise ValueError("Provide exactly one of ua_name, ua_contains, ua_names")
-
-    if ua_name is not None:
-        fc = ua_fc.filter(ee.Filter.eq("NAME20", ua_name))
-    elif ua_contains is not None:
-        fc = ua_fc.filter(ee.Filter.stringContains("NAME20", ua_contains))
+def select_ua(ua_fc, ua_contains=None, ua_name=None, ua_names=None):
+    if ua_names is not None:
+        return ua_fc.filter(ee.Filter.inList('NAME20', list(ua_names)))
+    elif ua_name is not None:
+        return ua_fc.filter(ee.Filter.eq('NAME20', ua_name))
     else:
-        filt = None
-        for name in ua_names:
-            f = ee.Filter.eq("NAME20", name)
-            filt = f if filt is None else ee.Filter.Or(filt, f)
-        fc = ua_fc.filter(filt)
-    return fc
+        return ua_fc.filter(ee.Filter.stringContains('NAME20', ua_contains))
+
+# ------------------------------------------------------------------
+# 7. Extreme heat day labeling (PRISM tmax, independent of MODIS LST)
+# ------------------------------------------------------------------
+def label_extreme_days(df_all, city_geom, start_date, end_date, extreme_percentile=90):
+    """
+    Labels each day in df_all as extreme (1) or not (0), based on whether
+    PRISM daily max air temperature for that day falls in the top
+    `extreme_percentile` of summer (JJA) days in the given date range.
+
+    PRISM tmax is used instead of LST_urb or LST_rur to avoid circularity —
+    SUHI = LST_urb - LST_rur, so defining "extreme" using either of those
+    two variables would partially define the outcome using its own inputs.
+    PRISM is a fully independent data source (station-based air temperature
+    interpolation), so the extreme-day label is exogenous to the SUHI signal
+    being studied.
+    """
+    df_all = df_all.copy()
+    df_all["date"] = pd.to_datetime(df_all["date"])
+
+    prism = ee.ImageCollection("OREGONSTATE/PRISM/ANd").select("tmax")
+
+    def daily_mean(img):
+        val = img.reduceRegion(
+            reducer=ee.Reducer.mean(),
