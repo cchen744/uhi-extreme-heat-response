@@ -326,3 +326,4 @@ def label_extreme_days(df_all, city_geom, start_date, end_date, extreme_percenti
     def daily_mean(img):
         val = img.reduceRegion(
             reducer=ee.Reducer.mean(),
+        )
