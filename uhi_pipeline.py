@@ -127,6 +127,7 @@ def build_city_landsat_uhi(
 
     region = city_geom.buffer(3000)
 
+    # start exporting GeoTIFF into GEE (visualization)
     task_ext = ee.batch.Export.image.toDrive(
         image=uhi_extreme.clip(region),
         description=f"{name_for_file}_UHI_extreme_{export_scale_m}m",
@@ -293,6 +294,7 @@ def landsat_uhi_composite(
     def to_uhi(img):
         return (img.subtract(ee.Number(img.get("rur_ref")))
                    .rename("UHI")
+                   .toFloat()
                    .copyProperties(img, ["system:time_start"]))
  
     uhi_ic = ic.map(to_uhi)
