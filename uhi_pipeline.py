@@ -76,7 +76,7 @@ def build_city_landsat_uhi(
     extreme_percentile=90,
     cloud_max=40,
     export_scale_m=30,
-    drive_folder="UHI_poster",
+    drive_folder="UHI",
 ):
     """
     Runs the full PRISM-label + Landsat-composite pipeline for one city.
