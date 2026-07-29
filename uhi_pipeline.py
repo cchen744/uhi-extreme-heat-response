@@ -65,7 +65,6 @@ def select_ua(ua_fc, ua_contains=None, ua_name=None, ua_names=None):
 # ------------------------------------------------------------------
 # 6. city-level wrapper to get PRISM + Landsat dataframe
 # ------------------------------------------------------------------
-
 def build_city_landsat_uhi(
     city_name,
     ua_fc,
@@ -127,6 +126,7 @@ def build_city_landsat_uhi(
 
     region = city_geom.buffer(3000)
 
+    delta_uhi = uhi_extreme.subtract(uhi_base).rename("delta_UHI").toFloat()
     # start exporting GeoTIFF into GEE (visualization)
     task_ext = ee.batch.Export.image.toDrive(
         image=uhi_extreme.clip(region),
@@ -146,8 +146,20 @@ def build_city_landsat_uhi(
         crs="EPSG:3857",
         maxPixels=1e9,
     )
+
+    task_delta = ee.batch.Export.image.toDrive(
+        image=delta_uhi.clip(region),
+        description=f"{name_for_file}_UHI_delta_{export_scale_m}m",
+        folder=drive_folder,
+        region=region,
+        scale=export_scale_m,
+        crs="EPSG:3857",
+        maxPixels=1e9,
+    )
     task_ext.start()
     task_base.start()
+    task_delta.start()
+
     print(f"{city_name}: export tasks started — check the Tasks tab in the GEE Code Editor "
           f"or run task.status() to monitor")
 
@@ -159,7 +171,7 @@ def build_city_landsat_uhi(
         "n_extreme_scenes": n_ext_val,
         "n_baseline_scenes": n_base_val,
         "csv_path": str(csv_path),
-        "export_tasks": [task_ext.id, task_base.id],
+        "export_tasks": [task_ext.id, task_base.id, task_delta.id],
     }
 
 # ------------------------------------------------------------------
