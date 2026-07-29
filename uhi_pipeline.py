@@ -124,7 +124,7 @@ def build_city_landsat_uhi(
     n_base_val = n_base.getInfo()
     print(f"{city_name}: Landsat scenes — extreme = {n_ext_val}, baseline = {n_base_val}")
 
-    region = city_geom.buffer(3000)
+    region = urban_region # city_geom.buffer(3000)
 
     delta_uhi = uhi_extreme.subtract(uhi_base).rename("delta_UHI").toFloat()
     # start exporting GeoTIFF into GEE (visualization)
