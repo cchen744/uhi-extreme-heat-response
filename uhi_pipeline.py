@@ -306,18 +306,6 @@ def select_ua(ua_fc, ua_contains=None, ua_name=None, ua_names=None):
 # 7. Extreme heat day labeling (PRISM tmax, independent of MODIS LST)
 # ------------------------------------------------------------------
 def label_extreme_days(df_all, city_geom, start_date, end_date, extreme_percentile=90):
-    """
-    Labels each day in df_all as extreme (1) or not (0), based on whether
-    PRISM daily max air temperature for that day falls in the top
-    `extreme_percentile` of summer (JJA) days in the given date range.
-
-    PRISM tmax is used instead of LST_urb or LST_rur to avoid circularity —
-    SUHI = LST_urb - LST_rur, so defining "extreme" using either of those
-    two variables would partially define the outcome using its own inputs.
-    PRISM is a fully independent data source (station-based air temperature
-    interpolation), so the extreme-day label is exogenous to the SUHI signal
-    being studied.
-    """
     df_all = df_all.copy()
     df_all["date"] = pd.to_datetime(df_all["date"])
 
@@ -326,4 +314,28 @@ def label_extreme_days(df_all, city_geom, start_date, end_date, extreme_percenti
     def daily_mean(img):
         val = img.reduceRegion(
             reducer=ee.Reducer.mean(),
-        )
+            geometry=city_geom,
+            scale=4000,
+            maxPixels=1e9
+        ).get("tmax")
+        return ee.Feature(None, {"date": img.date().format("YYYY-MM-dd"), "tmax": val})
+
+    fc = ee.FeatureCollection(
+        prism.filterBounds(city_geom).filterDate(start_date, end_date).map(daily_mean)
+    )
+
+    prism_df = geemap.ee_to_df(fc)
+    prism_df["date"] = pd.to_datetime(prism_df["date"])
+    prism_df = prism_df.dropna(subset=["tmax"])
+
+    prism_summer = prism_df[prism_df["date"].dt.month.isin([6, 7, 8])]
+    threshold = prism_summer["tmax"].quantile(extreme_percentile / 100.0)
+    prism_df["is_extreme"] = (prism_df["tmax"] >= threshold).astype(int)
+
+    df_all = df_all.merge(prism_df[["date", "is_extreme"]], on="date", how="left")
+    df_all["is_extreme"] = df_all["is_extreme"].fillna(0).astype(int)
+
+    print(f"extreme days = {df_all['is_extreme'].sum()}, "
+          f"PRISM tmax p{extreme_percentile} threshold = {threshold:.2f}°C (summer-only)")
+
+    return df_all, threshold   
